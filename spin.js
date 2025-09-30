@@ -1,567 +1,793 @@
-// spin.js v2.7 (STRICT) — Win IFF pickColor == landedColor; PnL = payoutOr0 - bet; infinite run; colored logs
-// by CQ
+// spin2.js — v5.0 "adaptive–multi-expert"
+// ESM (package.json: { "type":"module" })
+// Usage:
+//   npm i undici
+//   node spin2
+//
+// Optional:
+//   BET_MODE=aggressive node spin2          // conservative | balanced | aggressive
+//   OPENAI_API_KEY=sk-... AI_DECIDER=1 node spin2   // AI co-pilot (tùy chọn)
+//
+// Notes:
+// - Không đảm bảo thắng. Server kiểm soát odds/payout/outcome.
+// - Win xác định DUY NHẤT: landedIndex === arm (bỏ qua isWin/winAmount server).
+// - Cookie: mỗi dòng trong data.txt (tab-sep ok). Proxy: proxy.txt (mỗi dòng 1 proxy).
+// - Endpoint/payload giữ nguyên như bạn đã F12.
 
 import fs from 'fs'
-import readline from 'readline'
 import { fetch, ProxyAgent } from 'undici'
 
-// ==================== CONFIG ====================
+/* =============================
+   SERVER & STATICS
+============================= */
+
 const BASE_URL = 'https://app.appleville.xyz'
 const ENDPOINT = `${BASE_URL}/api/trpc/cave.wheelSpin.spin?batch=1`
 
-const INDEX_TO_COLOR = ['RED', 'BLUE', 'GOLD', 'GREEN']
-const COLOR_TO_INDEX = { RED: 0, BLUE: 1, GOLD: 2, YELLOW: 2, GREEN: 3 }
+// Index↔Color
+const IDX2 = ['RED','BLUE','GOLD','GREEN']
+const COLOR2 = { RED:0, BLUE:1, GOLD:2, YELLOW:2, GREEN:3 }
 
-// Payout fixed đúng theo ảnh
-const MULTIPLIERS = [150, 5, 20, 1.15]
+// Payout multiplier WHEN you win:
+const MULT = [150, 5, 20, 1.15]
+const BREAKEVEN = MULT.map(m => 1/m)
 
-// Prior theo odds đúng theo ảnh
-const PRIOR_ODDS = [0.005, 0.15, 0.04, 0.805] // [RED, BLUE, GOLD, GREEN]
-const PRIOR_STRENGTH = 2000 // Số "mẫu ảo"
+/* =============================
+   WINDOWS / PRIORS / GUARDS
+============================= */
 
-// Học phân phối (soft) để thích nghi nhẹ
-const WARMUP_ROUNDS  = 24
-const DECAY          = 0.99995
+const W_FAST=48, W_SLOW=360, EMA_A=0.085
+const Z_LCB=2.58, Z_UCB=2.33
 
-// Exploration
-const EPS_START = 0.03
-const EPS_END   = 0.01
-function epsAtRound(r){ return Math.max(EPS_END, EPS_START * Math.exp(-r/400)) }
+// prior bias ưu tiên GREEN nhiều (theo thực nghiệm của bạn)
+const PRIOR=[0.35, 1.35, 0.55, 8.25]
 
-// Sizing tương đối
-const KELLY_CAP       = 0.15
-const BET_MIN_FACTOR  = 0.30
-const BET_MAX_FACTOR  = 1.10
-const RISK_AVERSION   = 0.75
+const WARMUP_UNTIL=90
 
-// Sizing tuyệt đối — tránh “bet to là thua”
-const ABS_SCOUT = 1000    // mức thăm dò cố định khi EV<=0/cooldown
-const ABS_MAX   = 6000    // trần tuyệt đối cho 1 lệnh
+// Gate sang màu khác chỉ khi EV rõ rệt:
+const BASE_GATE_MARGIN=0.010
+const GOLD_LOCK={ minObs:160, minLCB:BREAKEVEN[2]+0.018 }
+const RED_LOCK ={ minObs:240, minLCB:BREAKEVEN[0]+0.026 }
 
-// Cooldown & gate
-const EV_GATE_FACTOR      = 0.20
-const ROLL_N              = 40
-const ROLL_MIN_WINRATE    = 0.28
-const COOLDOWN_ROUNDS     = 20
-const COOLDOWN_BET_FACTOR = 0.25
+// Bet guard
+const ABS_MIN_BET=100
+const MAX_BET=20000   // mở trần lên chút (nếu muốn, hạ về 12000)
+const MIN_UNIT=50     // bội số làm tròn
 
-// HTTP
-const MIN_DELAY = 900
-const MAX_DELAY = 2200
-const RETRIES   = 3
-const BACKOFF_BASE = 600
+// Pacing
+const MIN_DELAY_OK=[680, 1150]
+const MIN_DELAY_SAME=[900, 1500]
+const DELAY_BACKOFF=[2200, 4200]
+const JITTER_EXTRA=[0, 220]
+const BURST_GAP_MS=300
 
-// Log
-const LOG_FILE = 'spin-log.csv'
-// =================================================
+// Vol & risk guards
+const VOL_WIN=160, VOL_TARGET=0.12
+const MAX_LOSS_STREAK=3, FIREWALL_SPINS=10, FIREWALL_CUT=0.45
+const TILT_WINDOW=40, TILT_DD=-11000, TILT_COOL_MS=5500
+const STREAK_WIN_BOOST_AFTER=3
 
-const waitMs = (ms) => new Promise(r => setTimeout(r, ms))
-const randInt = (a,b)=> Math.floor(Math.random()*(b-a+1))+a
+// Session take profit / stop loss (tùy chọn, null = vô hiệu)
+const TAKE_PROFIT=null
+const STOP_LOSS=null
 
-// ===== CSV / number fmt =====
-function csv(v){ if (v==null) return ''; const s=String(v); return /[",\n]/.test(s)?`"${s.replace(/"/g,'""')}"`:s }
-const nf = (n,d=4)=> (typeof n==='number' && isFinite(n)) ? Number(n).toFixed(d) : ''
-const ni = (n)=> (typeof n==='number' && isFinite(n)) ? Math.round(n) : ''
-const pfx = (n)=> (n>=0?`+${n}`:`${n}`)
+/* =============================
+   STRATEGY PROFILES
+============================= */
 
-// ===== IO =====
-function parseAccounts(file = 'data.txt') {
-  if (!fs.existsSync(file)) return []
-  const lines = fs.readFileSync(file, 'utf8').split(/\r?\n/).map(s => s.trim()).filter(Boolean)
-  return lines.map((line, i) => {
-    const parts = line.split('\t')
-    const cookie = parts[0]
-    const bet = Number(parts[1] ?? NaN)
-    const index = Number(parts[2] ?? NaN)
-    return { i, cookie, bet, index }
-  })
-}
-function parseProxies(file = 'proxy.txt') {
-  if (!fs.existsSync(file)) return []
-  return fs.readFileSync(file, 'utf8').split(/\r?\n/).map(s => s.trim()).filter(Boolean)
-}
-function pickProxyAgent(proxies, i) {
-  if (!proxies.length) return null
-  const url = proxies[i % proxies.length]
-  try { return new ProxyAgent(url) } catch { return null }
-}
-
-function headersFor(cookie) {
-  return {
-    'accept': '*/*',
-    'content-type': 'application/json',
-    'cookie': cookie,
-    'origin': BASE_URL,
-    'referer': `${BASE_URL}/`,
-    'trpc-accept': 'application/jsonl',
-    'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36',
-    'x-client-version': '1.0.0',
-    'x-trpc-source': 'nextjs-react',
+const STRATEGY = process.env.BET_MODE || 'balanced'
+const PROFILES = {
+  conservative: {
+    MIN_FRAC:0.00012, MIN_FRAC_CAP:0.00045,
+    RISK_BASE:0.0015, RISK_CAP:0.0048,
+    KELLY_CAP:0.18, EDGE_BOOST:0.38,
+    STREAK_WIN_BOOST:0.05,
+    RECOV_CAP_FRAC:0.35,  // trần lane khôi phục
+    RECOV_GAIN_FRAC:0.08, // nhích lại một phần lỗ chưa thu hồi
+  },
+  balanced: {
+    MIN_FRAC:0.00018, MIN_FRAC_CAP:0.00075,
+    RISK_BASE:0.0024, RISK_CAP:0.0085,
+    KELLY_CAP:0.26, EDGE_BOOST:0.60,
+    STREAK_WIN_BOOST:0.10,
+    RECOV_CAP_FRAC:0.45,
+    RECOV_GAIN_FRAC:0.12,
+  },
+  aggressive: {
+    MIN_FRAC:0.00032, MIN_FRAC_CAP:0.00130,
+    RISK_BASE:0.0035, RISK_CAP:0.0130,
+    KELLY_CAP:0.36, EDGE_BOOST:0.92,
+    STREAK_WIN_BOOST:0.16,
+    RECOV_CAP_FRAC:0.55,
+    RECOV_GAIN_FRAC:0.16,
   }
 }
-const buildBody = (idx, bet)=> JSON.stringify({ '0': { json: { selectedIndex: idx, betAmount: bet } } })
+const P = PROFILES[STRATEGY] || PROFILES.balanced
 
-// ===== Parse response (robust JSONL) =====
-function parseJsonlCandidates(text){
-  const lines = String(text).split('\n').filter(Boolean)
-  const objs = []
-  for (const line of lines){
-    try { objs.push(JSON.parse(line)) } catch {}
-  }
-  if (!objs.length){
-    try { objs.push(JSON.parse(text)) } catch {}
-  }
-  return objs
+/* =============================
+   OPTIONAL AI DECIDER
+============================= */
+
+const AI_DECIDER = process.env.AI_DECIDER === '1' || process.env.AI_DECIDER === 'true'
+let openaiClient = null
+async function aiReady(){
+  if(!AI_DECIDER) return false
+  if(!process.env.OPENAI_API_KEY) return false
+  if(openaiClient) return true
+  try{
+    const mod = await import('openai')
+    openaiClient = new mod.default({ apiKey: process.env.OPENAI_API_KEY })
+    return true
+  }catch{ return false }
 }
-function huntCandidates(x, acc=[]){
-  if (!x || typeof x !== 'object') return acc
-  const has = ('winningIndex' in x) || ('resultIndex' in x) || ('winAmount' in x) ||
-              ('payout' in x) || ('isWin' in x) || ('winningColor' in x)
-  if (has) acc.push(x)
-  if (Array.isArray(x)){
-    for (const it of x) huntCandidates(it, acc)
-  } else {
-    for (const k of Object.keys(x)) huntCandidates(x[k], acc)
-  }
-  return acc
-}
-function scoreOutcomeNode(n){
-  let sc = 0
-  if ('winningIndex' in n) sc += 3
-  if ('resultIndex'  in n) sc += 2
-  if ('winningColor' in n) sc += 2
-  if ('isWin'        in n) sc += 1
-  if ('winAmount'    in n) sc += 2
-  if ('payout'       in n) sc += 2
-  return sc
-}
-function extractOutcomeStrict(text){
-  const roots = parseJsonlCandidates(text)
-  const all = []
-  for (const r of roots) huntCandidates(r, all)
-  if (!all.length) return { landedIndex: undefined, color: undefined, raw: roots[roots.length-1] ?? text }
-
-  let best = null, bestScore = -1
-  for (const c of all){
-    const s = scoreOutcomeNode(c)
-    if (s >= bestScore){ bestScore = s; best = c }
-  }
-
-  const landedIndex =
-    (typeof best?.winningIndex === 'number' ? best.winningIndex : undefined) ??
-    (typeof best?.resultIndex  === 'number' ? best.resultIndex  : undefined)
-  const color = (typeof best?.winningColor === 'string' ? best.winningColor.toUpperCase() : undefined)
-
-  return { landedIndex, color, raw: best }
-}
-
-// ===== Math utils =====
-function gammaSample(shape){
-  if (shape < 1) { const u = Math.random(); return gammaSample(shape + 1) * Math.pow(u, 1/shape) }
-  const d = shape - 1/3, c = 1/Math.sqrt(9*d)
-  while (true){
-    let x, v
-    do {
-      const u1 = Math.random(), u2 = Math.random()
-      const z = Math.sqrt(-2*Math.log(u1)) * Math.cos(2*Math.PI*u2)
-      x = z; v = 1 + c*x
-    } while (v <= 0)
-    v = v*v*v
-    const u = Math.random()
-    if (u < 1 - 0.0331 * (x*x)*(x*x)) return d*v
-    if (Math.log(u) < 0.5*x*x + d*(1 - v + Math.log(v))) return d*v
-  }
-}
-function dirichletSample(alpha){
-  const g = alpha.map(a => gammaSample(Math.max(1e-6, a)))
-  const s = g.reduce((x,y)=>x+y,0) || 1
-  return g.map(v=>v/s)
-}
-
-// ===== Prior từ odds =====
-function priorFromOdds(odds, S0=PRIOR_STRENGTH){
-  return odds.map(p => Math.max(1, p * S0))
-}
-
-// ===== Dirichlet TS (không học multiplier) =====
-class DirichletTS {
-  constructor(K, initAlpha=1){
-    this.K = K
-    this.alpha = Array(K).fill(initAlpha)
-  }
-  setAlpha(a){ if (Array.isArray(a) && a.length===this.K) this.alpha = a.slice() }
-  decay(f=DECAY){ for (let i=0;i<this.K;i++) this.alpha[i] = Math.max(1, this.alpha[i]*f) }
-  updateFromLanded(idx){ if (Number.isInteger(idx) && idx>=0 && idx<this.K) this.alpha[idx] += 1 }
-  postMean(){ const S = this.alpha.reduce((s,v)=>s+v,0); return this.alpha.map(a=>a/S) }
-  getAlpha(){ return this.alpha.slice() }
-
-  static pLCB(alpha, i, z=2.33){
-    const S = alpha.reduce((s,v)=>s+v,0)
-    const ai = alpha[i]
-    const mean = ai / S
-    const v = (ai * (S - ai)) / (S*S*(S+1))
-    const sd = Math.sqrt(Math.max(1e-12, v))
-    return { mean, var:v, sd, lcb: Math.max(0, mean - z*sd) }
-  }
-
-  chooseArmLCB(epsilon = 0.01, mults = MULTIPLIERS){
-    if (Math.random() < epsilon) return { arm: randInt(0,this.K-1), ev: null, lcb: null, mean: null, v:null }
-    const a = this.alpha
-    let best = 0, bestScore = -Infinity, bestLCB=0, bestMean=0, bestVar=0
-    for (let k=0;k<this.K;k++){
-      const {mean, var:v, lcb} = DirichletTS.pLCB(a, k, 2.33)
-      const ev = lcb * mults[k] - 1
-      if (ev > bestScore){ bestScore = ev; best = k; bestLCB=lcb; bestMean=mean; bestVar=v }
+async function aiSuggest({ ctx, signals, proposal }){
+  if(!(await aiReady())) return null
+  const model = process.env.AI_MODEL || 'gpt-5-mini'
+  const json_schema = {
+    name:"SpinDecision",
+    schema:{
+      type:"object", additionalProperties:false,
+      properties:{
+        arm:{type:"integer",enum:[0,1,2,3]},
+        betMultiplier:{type:"number",minimum:0,maximum:3},
+        reason:{type:"string",maxLength:512}
+      },
+      required:["arm","betMultiplier","reason"]
     }
-    return { arm: best, ev: bestScore, lcb: bestLCB, mean: bestMean, v: bestVar }
+  }
+  try{
+    const resp = await openaiClient.responses.create({
+      model, reasoning:{effort:"medium"},
+      input:[
+        {role:"system",content:"You optimize EV with minimal DD. Return JSON only."},
+        {role:"user",content:[
+          {type:"text",text:"Return JSON by schema."},
+          {type:"input_json",input_json:{context:ctx, signals, internalProposal:proposal}}
+        ]}
+      ],
+      response_format:{type:"json_schema", json_schema}
+    })
+    const out = resp.output?.[0]?.content?.[0]
+    const txt = out?.type==="output_text" ? out.text : null
+    if(!txt) return null
+    let parsed; try{ parsed=JSON.parse(txt) }catch{ return null }
+    if(typeof parsed.arm!=='number'||parsed.arm<0||parsed.arm>3) return null
+    if(typeof parsed.betMultiplier!=='number'||!isFinite(parsed.betMultiplier)) return null
+    parsed.betMultiplier = Math.max(0, Math.min(3, parsed.betMultiplier))
+    return parsed
+  }catch{ return null }
+}
+
+/* =============================
+   UTILS
+============================= */
+
+const sleep=ms=>new Promise(r=>setTimeout(r,ms))
+const randInt=(a,b)=>Math.floor(Math.random()*(b-a+1))+a
+const clamp=(x,lo,hi)=>Math.max(lo,Math.min(hi,x))
+const now=()=>Date.now()
+const same=(a,b)=>a===b
+const roundUnit=(x,unit=MIN_UNIT)=>Math.round(x/unit)*unit
+
+const readLines = p => fs.existsSync(p)
+  ? fs.readFileSync(p,'utf8').split(/\r?\n/).map(s=>s.trim()).filter(Boolean)
+  : []
+
+const headersFor = (cookie)=> ({
+  'accept':'*/*',
+  'content-type':'application/json',
+  'cookie':cookie,
+  'origin':BASE_URL,
+  'referer':`${BASE_URL}/`,
+  'trpc-accept':'application/jsonl',
+  'user-agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36',
+  'x-client-version':'1.0.0',
+  'x-trpc-source':'nextjs-react',
+})
+const bodyFor = (idx,bet)=> JSON.stringify({'0':{json:{selectedIndex:idx, betAmount:bet}}})
+
+function parseJSON(text){
+  try { return JSON.parse(text) } catch {
+    const arr = text.split('\n').filter(Boolean)
+    if(arr.length===1){ try{return JSON.parse(arr[0])}catch{return text} }
+    return arr.map(l=>{ try{return JSON.parse(l)}catch{return{raw:l}} })
   }
 }
 
-// Kelly
-function kellyFraction(p, mult){
-  const b = Math.max(1e-9, mult - 1), q = 1 - p
-  return Math.max(0, (b*p - q)/b)
+// chọn node chứa nhiều dấu hiệu nhất (winningIndex/winningColor/...)
+function extractOutcome(raw){
+  const weight = (x)=> !x||typeof x!=='object' ? -1 :
+    (('winningIndex'in x)*3 + ('winningColor'in x)*3 + ('resultIndex'in x) + ('newBalance'in x))
+  const hunt = (x)=>{
+    if(!x||typeof x!=='object') return null
+    if(Array.isArray(x)){ let best=null,sc=-1; for(const it of x){ const c=hunt(it); const w=weight(c); if(c&&w>sc){best=c;sc=w}} return best }
+    let bestSelf = weight(x)>0 ? x : null
+    let bestChild=null, sc=-1
+    for(const k of Object.keys(x)){ const c=hunt(x[k]); const w=weight(c); if(c&&w>sc){bestChild=c; sc=w} }
+    return (weight(bestChild)>=weight(bestSelf)) ? bestChild : bestSelf
+  }
+  const n = hunt(raw) || (Array.isArray(raw)? raw.at(-1) : raw)
+  const landedIndex = Number.isInteger(n?.winningIndex) ? n.winningIndex
+                    : Number.isInteger(n?.resultIndex)  ? n.resultIndex
+                    : undefined
+  const color = typeof n?.winningColor==='string'
+      ? n.winningColor.toUpperCase()
+      : (Number.isInteger(landedIndex) ? IDX2[landedIndex] : undefined)
+  const balance   = typeof n?.newBalance==='number' ? n.newBalance : undefined
+  return { landedIndex, color, balance, raw:n||raw }
 }
-function clamp(x,lo,hi){ return Math.min(hi, Math.max(lo,x)) }
 
-// ===== HTTP =====
-async function spinOnce({ cookie, betAmount, armIndex, dispatcher }) {
-  const headers = headersFor(cookie)
-  const body = buildBody(armIndex, betAmount)
-  for (let t=0; t<=RETRIES; t++){
-    try{
-      const res = await fetch(ENDPOINT, { method:'POST', headers, body, dispatcher })
-      const text = await res.text()
-      return { ok: res.ok, status: res.status, text, attempt: t+1 }
-    }catch(e){
-      if (t === RETRIES) throw e
+async function spin({cookie, idx, bet, dispatcher}){
+  const res = await fetch(ENDPOINT, { method:'POST', headers:headersFor(cookie), body:bodyFor(idx,bet), dispatcher })
+  const text = await res.text()
+  return { ok:res.ok, status:res.status, parsed:parseJSON(text) }
+}
+function minDelayFor(status, prevSame){
+  const s=String(status||'')
+  if(s.startsWith('429')||s.startsWith('5')) return randInt(...DELAY_BACKOFF)
+  return randInt(...(prevSame? MIN_DELAY_SAME : MIN_DELAY_OK))
+}
+
+/* =============================
+   STATS, EXPERTS & REGIME
+============================= */
+
+class Ensemble {
+  constructor(k=4, nF=W_FAST, nS=W_SLOW, alpha=EMA_A, prior=PRIOR){
+    this.k=k
+    this.nF=nF; this.nS=nS; this.alpha=alpha
+    this.qF=[]; this.cF=Array(k).fill(0)
+    this.qS=[]; this.cS=Array(k).fill(0)
+    this.ema=Array(k).fill(0)
+    this.prior = prior.slice()
+    this.mk1 = Array.from({length:k}, ()=> Array(k).fill(0))
+    this.mk2 = {}
+    this.h1=null; this.h2=null
+    this.greenStreak=0
+    this.winStreak=0
+    this.last=null
+    // expert weights (will adapt online)
+    this.expertW = { FreqEMA:1, LCB:1, TS:1, MK1:1, MK2:1, Streak:1 }
+  }
+  reset(keep=0.35){
+    const scale=x=>Math.round(x*keep)
+    this.cF=this.cF.map(scale); this.cS=this.cS.map(scale)
+    this.qF=this.qF.slice(-Math.round(this.qF.length*keep))
+    this.qS=this.qS.slice(-Math.round(this.qS.length*keep))
+    this.ema=this.ema.map(x=>x*keep)
+    for(let i=0;i<this.k;i++) for(let j=0;j<this.k;j++) this.mk1[i][j]=Math.round(this.mk1[i][j]*keep)
+    Object.keys(this.mk2).forEach(key=>{
+      this.mk2[key]=this.mk2[key].map(scale)
+      if(this.mk2[key].every(v=>v===0)) delete this.mk2[key]
+    })
+    if(this.greenStreak>0) this.greenStreak=Math.round(this.greenStreak*keep)
+    if(this.winStreak>0)   this.winStreak=Math.round(this.winStreak*keep)
+    // soften expert weights
+    for(const k of Object.keys(this.expertW)) this.expertW[k] = 0.6*this.expertW[k] + 0.4
+  }
+  push(i, didWin){
+    if(typeof i==='number'){
+      this.qF.push(i); this.cF[i]++; if(this.qF.length>this.nF){ const o=this.qF.shift(); this.cF[o]-- }
+      this.qS.push(i); this.cS[i]++; if(this.qS.length>this.nS){ const o=this.qS.shift(); this.cS[o]-- }
+      for(let a=0;a<this.k;a++) this.ema[a]=this.alpha*(a===i?1:0)+(1-this.alpha)*this.ema[a]
+      if(this.last!=null) this.mk1[this.last][i]++
+      if(this.h1!=null && this.h2!=null){
+        const key=`${this.h1},${this.h2}`
+        if(!this.mk2[key]) this.mk2[key]=Array(this.k).fill(0)
+        this.mk2[key][i]++
+      }
+      this.h1=this.h2; this.h2=i
+      this.last = i
+      if(i===3) this.greenStreak++; else this.greenStreak=0
     }
-    await waitMs(BACKOFF_BASE * Math.pow(2,t) + randInt(0,300))
-  }
-  return { ok:false, status:0, text:'', attempt:RETRIES+1 }
-}
-
-// ===== CSV header =====
-function ensureLogHeader(){
-  if (!fs.existsSync(LOG_FILE)){
-    fs.writeFileSync(LOG_FILE,
-      [
-        'ts','round','acc','bet_base','bet_used','bet_factor','index','color',
-        'ok','status','landedIndex','payout_used',
-        'p_mean','p_lcb','mult_est','EV_LCB','edge_mean',
-        'kelly','net','pnl','reason','alpha','raw'
-      ].join(',')+'\n'
-    )
-  }
-}
-function appendLog(row){
-  const line = [
-    csv(new Date().toISOString()),
-    csv(row.round),
-    csv(row.acc),
-    csv(row.betBase),
-    csv(row.betUsed),
-    csv(nf(row.betFactor,6)),
-    csv(row.index),
-    csv(row.color),
-    csv(row.ok),
-    csv(row.status),
-    csv(row.landedIndex ?? ''),
-    csv(row.payoutUsed ?? ''),
-    csv(nf(row.pMean,6)),
-    csv(nf(row.pLCB,6)),
-    csv(nf(row.multEst,6)),
-    csv(nf(row.evLCB,6)),
-    csv(nf(row.edgeMean,6)),
-    csv(nf(row.kelly,6)),
-    csv(row.net),
-    csv(row.pnl),
-    csv(row.reason),
-    csv(JSON.stringify(row.alpha)),
-    csv(JSON.stringify(row.raw))
-  ].join(',')+'\n'
-  fs.appendFileSync(LOG_FILE, line)
-}
-
-// ======================= UI LAYER =======================
-// ANSI colors + backgrounds
-const C = {
-  none: s=>s,
-  bold:  s=>`\x1b[1m${s}\x1b[0m`,
-  red:   s=>`\x1b[31m${s}\x1b[0m`,
-  green: s=>`\x1b[32m${s}\x1b[0m`,
-  yellow:s=>`\x1b[33m${s}\x1b[0m`,
-  blue:  s=>`\x1b[34m${s}\x1b[0m`,
-  bgRed:    s=>`\x1b[41m\x1b[97m${s}\x1b[0m`,
-  bgBlue:   s=>`\x1b[44m\x1b[97m${s}\x1b[0m`,
-  bgYellow: s=>`\x1b[43m\x1b[30m${s}\x1b[0m`,
-  bgGreen:  s=>`\x1b[42m\x1b[30m${s}\x1b[0m`,
-}
-const ANSI_RE = /\x1B\[[0-9;]*m/g
-const stripAnsi = s => String(s).replace(ANSI_RE, '')
-const visLen = s => stripAnsi(s).length
-function truncAnsi(s, width){
-  s = String(s)
-  if (visLen(s) <= width) return s
-  const ell = '…'
-  const target = Math.max(0, width - ell.length)
-  let out = '', v = 0
-  for (let i=0;i<s.length;i++){
-    const ch = s[i]
-    if (ch === '\x1b'){
-      const m = s.slice(i).match(/^\x1B\[[0-9;]*m/)
-      if (m){ out += m[0]; i += m[0].length-1; continue }
+    if(typeof didWin==='boolean'){
+      if(didWin) this.winStreak++; else this.winStreak=0
     }
-    if (v < target){ out += ch; v++ } else break
   }
-  return out + ell
-}
-function padAnsi(s, width, align='left'){
-  s = String(s)
-  const pad = Math.max(0, width - visLen(s))
-  if (align === 'right') return ' '.repeat(pad) + s
-  if (align === 'center') { const l = Math.floor(pad/2), r = pad - l; return ' '.repeat(l) + s + ' '.repeat(r) }
-  return s + ' '.repeat(pad)
-}
-
-// Column widths
-const COL = {
-  round: 8,  pick: 6,  color: 7,  p: 7,  lcb: 7,
-  mult: 6,   EV: 7,    edge: 7,   baseUsed: 18,
-  landed: 8, payout: 10, net: 10,  pnl: 12, tags: 24
-}
-function colorChip(name, bg=false){
-  const up = String(name||'').toUpperCase()
-  if (!bg){
-    if (up==='RED')   return C.red(up)
-    if (up==='BLUE')  return C.blue(up)
-    if (up==='GOLD')  return C.yellow(up)
-    if (up==='GREEN') return C.green(up)
-    return up
+  len(){ return this.qS.length }
+  cnt(a){ return this.cS[a] }
+  pFast(a){ const N=this.qF.length, S=this.prior.reduce((s,x)=>s+x,0); const f=(this.cF[a]+this.prior[a])/(N+S||1); return clamp(0.55*f+0.45*this.ema[a],0,1) }
+  pSlow(a){ const N=this.qS.length, S=this.prior.reduce((s,x)=>s+x,0); const f=(this.cS[a]+this.prior[a])/(N+S||1); return clamp(0.70*f+0.30*this.ema[a],0,1) }
+  wilsonLCB(a,z=Z_LCB){ const n=this.qS.length; if(n<=0) return 0; const x=this.cS[a]; const ph=x/n; const den=1+z*z/n; const center=(ph+z*z/(2*n))/den; const delta=z*Math.sqrt((ph*(1-ph)+z*z/(4*n))/n)/den; return clamp(center-delta,0,1) }
+  wilsonUCB(a,z=Z_UCB){ const n=this.qS.length; if(n<=0) return 1; const x=this.cS[a]; const ph=x/n; const den=1+z*z/n; const center=(ph+z*z/(2*n))/den; const delta=z*Math.sqrt((ph*(1-ph)+z*z/(4*n))/n)/den; return clamp(center+delta,0,1) }
+  tsSample(){
+    const samp = new Array(this.k).fill(0)
+    const S = this.cS.reduce((s,x,i)=> s + (x + this.prior[i] + 1e-3), 0) || 1
+    const N = Math.max(1,this.len())
+    for(let a=0;a<this.k;a++){
+      const alpha = this.cS[a] + this.prior[a] + 1e-3
+      const mean = alpha / S
+      const sd   = Math.sqrt(mean*(1-mean)/N)
+      const z    = (Math.random()*2-1)*1.0
+      samp[a] = clamp(mean + z*sd, 0, 1)
+    }
+    return samp
   }
-  if (up==='RED')   return C.bgRed(up)
-  if (up==='BLUE')  return C.bgBlue(up)
-  if (up==='GOLD')  return C.bgYellow(up)
-  if (up==='GREEN') return C.bgGreen(up)
-  return up
-}
-function makeHeader(sep=' │ '){
-  return [
-    ['r',COL.round,'right'], ['pick',COL.pick], ['color',COL.color],
-    ['p',COL.p,'right'], ['lcb',COL.lcb,'right'], ['mult',COL.mult,'right'],
-    ['EV',COL.EV,'right'], ['edge',COL.edge,'right'],
-    ['base->used',COL.baseUsed], ['landed',COL.landed],
-    ['payoutUsed',COL.payout,'right'], ['net',COL.net,'right'], ['pnl',COL.pnl,'right'],
-    ['tags',COL.tags]
-  ].map(([t,w,a])=> padAnsi(t,w,a)).join(' │ ')
-}
-function makeRow(o, sep=' │ '){
-  const evTxt   = (o.evLCB<=0 ? C.red(nf(o.evLCB,4)) : C.green(nf(o.evLCB,4)))
-  const edgeTxt = (o.edgeMean<=0 ? C.red(nf(o.edgeMean,4)) : C.green(nf(o.edgeMean,4)))
-  const netTxt  = (o.net>=0 ? C.green(pfx(ni(o.net))) : C.red(pfx(ni(o.net))))
-  const pnlTxt  = (o.pnl>=0 ? C.green(pfx(ni(o.pnl))) : C.red(pfx(ni(o.pnl))))
-  const pickTxt   = colorChip(o.color, true)
-  const landedTxt = colorChip(o.landedName, true)
-  const tags = (o.tags||[]).join('|')
+  pMarkov1(next){
+    if(this.last==null) return 0.25
+    const row=this.mk1[this.last]; const sum=row.reduce((a,b)=>a+b,0)
+    return sum? clamp(row[next]/sum,0,1) : 0.25
+  }
+  pMarkov2(next){
+    if(this.h1==null||this.h2==null) return 0.25
+    const row=this.mk2[`${this.h1},${this.h2}`]
+    if(!row) return 0.25
+    const sum=row.reduce((a,b)=>a+b,0)
+    return sum? clamp(row[next]/sum,0,1) : 0.25
+  }
+  // === Expert aggregator ===
+  expertProbs(){
+    // 6 experts → một vector p[4] mỗi expert, rồi trọng số
+    const pTS = this.tsSample()
+    const pE = new Array(4).fill(0)
+    const norm=(v)=>{ const s=v.reduce((a,b)=>a+b,0)||1; return v.map(x=>x/s) }
 
-  const cells = [
-    padAnsi(`${o.round}`, COL.round, 'right'),
-    padAnsi(o.index,                  COL.pick,  'right'),
-    padAnsi(pickTxt,                  COL.color),
-    padAnsi(nf(o.pMean,4),            COL.p,     'right'),
-    padAnsi(nf(o.pLCB,4),             COL.lcb,   'right'),
-    padAnsi(nf(o.multEst,3),          COL.mult,  'right'),
-    padAnsi(evTxt,                    COL.EV,    'right'),
-    padAnsi(edgeTxt,                  COL.edge,  'right'),
-    padAnsi(`${o.betBase}->${o.betUsed}(${nf(o.betFactor,2)})`, COL.baseUsed),
-    padAnsi(truncAnsi(landedTxt, COL.landed), COL.landed),
-    padAnsi(nf(o.payoutUsed,2),       COL.payout,'right'),
-    padAnsi(netTxt,                   COL.net,   'right'),
-    padAnsi(pnlTxt,                   COL.pnl,   'right'),
-    padAnsi(truncAnsi(tags, COL.tags),COL.tags)
-  ]
-  return cells.join(sep)
-}
-const HR = (h)=> '─'.repeat(h.length)
-function createPrettyPrinter(repeatHeaderEvery=25){
-  let n=0
-  const header = makeHeader(' │ ')
-  const line = HR(header)
-  return {
-    push(row){
-      if (n % repeatHeaderEvery === 0){ console.log(line); console.log(header); console.log(line) }
-      console.log(makeRow(row, ' │ '))
-      n++
+    const ex = {
+      FreqEMA: norm([0,1,2,3].map(a=> 0.45*this.pSlow(a)+0.55*this.pFast(a) )),
+      LCB    : norm([0,1,2,3].map(a=> this.wilsonLCB(a) )),
+      TS     : norm(pTS),
+      MK1    : norm([0,1,2,3].map(a=> this.pMarkov1(a) )),
+      MK2    : norm([0,1,2,3].map(a=> this.pMarkov2(a) )),
+      Streak : norm([0,1,2,3].map(a=>{
+        // nếu GREEN đang streak dài, ưu tiên giữ GREEN; nếu không, giảm nhẹ GREEN
+        const base = this.pSlow(a)
+        if(a===3){
+          return base * (1 + Math.min(0.25, this.greenStreak*0.03))
+        } else {
+          return base * (1 - Math.min(0.12, this.greenStreak*0.02))
+        }
+      }))
+    }
+    const W = this.expertW
+    const sumW = Object.values(W).reduce((a,b)=>a+b,0)||1
+    for(const [name, vec] of Object.entries(ex)){
+      const w = (W[name]||1)/sumW
+      for(let a=0;a<4;a++) pE[a] += w*vec[a]
+    }
+    return clampVec(pE)
+  }
+  updateExpertWeights(landed){
+    // multiplicative weights (hedge): tăng trọng số các expert dự đoán cao xác suất landed
+    if(landed==null) return
+    const probs = {
+      FreqEMA: probOf(this,'FreqEMA', landed),
+      LCB    : probOf(this,'LCB', landed),
+      TS     : probOf(this,'TS', landed),
+      MK1    : probOf(this,'MK1', landed),
+      MK2    : probOf(this,'MK2', landed),
+      Streak : probOf(this,'Streak', landed),
+    }
+    const eta=0.25
+    for(const k of Object.keys(this.expertW)){
+      const p = clamp(probs[k], 1e-6, 1-1e-6)
+      this.expertW[k] *= Math.exp(eta*Math.log(p))
+      // tránh tràn/teo quá mức
+      this.expertW[k] = clamp(this.expertW[k], 0.25, 8)
     }
   }
 }
+function clampVec(v){ const s=v.reduce((a,b)=>a+b,0)||1; return v.map(x=> clamp(x/s,0,1)) }
+function probOf(est, which, a){
+  // tái tạo cùng cách tính trong expertProbs()
+  const norm=(v)=>{ const s=v.reduce((x,y)=>x+y,0)||1; return v.map(z=>z/s) }
+  if(which==='TS'){
+    const pTS = est.tsSample()
+    const v = clampVec(pTS)
+    return v[a]
+  }
+  if(which==='FreqEMA'){
+    const v = norm([0,1,2,3].map(i=> 0.45*est.pSlow(i)+0.55*est.pFast(i) ))
+    return v[a]
+  }
+  if(which==='LCB'){
+    const v = norm([0,1,2,3].map(i=> est.wilsonLCB(i) ))
+    return v[a]
+  }
+  if(which==='MK1'){
+    const v = norm([0,1,2,3].map(i=> est.pMarkov1(i) ))
+    return v[a]
+  }
+  if(which==='MK2'){
+    const v = norm([0,1,2,3].map(i=> est.pMarkov2(i) ))
+    return v[a]
+  }
+  if(which==='Streak'){
+    const v = norm([0,1,2,3].map(i=>{
+      const base = est.pSlow(i)
+      if(i===3) return base * (1 + Math.min(0.25, est.greenStreak*0.03))
+      return base * (1 - Math.min(0.12, est.greenStreak*0.02))
+    }))
+    return v[a]
+  }
+  return 0.25
+}
 
-// ==================== RUN 1 ACCOUNT (INFINITE) ====================
-async function runForAccount({ idxAcc, cookie, baseBet, baseIndex, roundsLimit, dispatcher, logEvery, uiMode }) {
-  console.log(`\n===== ACCOUNT #${idxAcc + 1} =====`)
-  const ts = new DirichletTS(4)
-  ts.setAlpha(priorFromOdds(PRIOR_ODDS, PRIOR_STRENGTH))
-
-  let pnl = 0
-  let cooldownLeft = 0
-  const recentWins = []
-
-  const printer = createPrettyPrinter(25) // luôn pretty có màu; dùng terminal hỗ trợ ANSI
-
-  for (let r=1; ; r++){ // chạy vô hạn; dừng nếu roundsLimit được set
-    if (Number.isFinite(roundsLimit) && r > roundsLimit) break
-
-    // pick
-    let arm, evLCB=null, pLCB=null, pMean=null, reason=[]
-    if (Number.isFinite(baseIndex)) { arm = baseIndex; reason.push('FORCE_IDX') }
-    else if (r <= WARMUP_ROUNDS)     { arm = (r-1) % 4; reason.push('WARMUP') }
-    else {
-      const pick = ts.chooseArmLCB(epsAtRound(r), MULTIPLIERS)
-      arm = pick.arm; evLCB = pick.ev; pLCB = pick.lcb; pMean = pick.mean
+// Explorer: EXP3 + UCB
+class Explorer {
+  constructor(k=4){ this.k=k; this.w=Array(k).fill(1); this.t=0; this.r=Array(k).fill(0); this.n=Array(k).fill(0); this.sq=Array(k).fill(0) }
+  exp3Prob(gamma=0.08){
+    const W=this.w.reduce((a,b)=>a+b,0)||1
+    return this.w.map(w=> (1-gamma)*(w/W) + gamma/this.k )
+  }
+  updateExp3(a, reward, gamma=0.08){
+    this.t++
+    const p=this.exp3Prob(gamma)[a]
+    const x = reward/p
+    this.w[a] *= Math.exp((gamma*x)/this.k)
+  }
+  ucbTuned(){
+    const t=Math.max(1,this.t)
+    const res=new Array(this.k).fill(0)
+    for(let a=0;a<this.k;a++){
+      const n=this.n[a]||1e-9
+      const mean=this.r[a]/Math.max(1,this.n[a])
+      const varU = this.sq[a]/Math.max(1,this.n[a]) - mean*mean + Math.sqrt(2*Math.log(t)/Math.max(1,this.n[a]))
+      res[a]= mean + Math.sqrt(Math.log(t)/Math.max(1,this.n[a]) * Math.min(0.25, varU))
     }
-    const color = INDEX_TO_COLOR[arm] || `IDX_${arm}`
-    if (pMean == null) pMean = ts.postMean()[arm]
-    if (pLCB == null) pLCB = DirichletTS.pLCB(ts.getAlpha(), arm, 2.33).lcb
-    const multEst  = MULTIPLIERS[arm]
-    const edgeMean = pMean * multEst - 1
-    if (evLCB == null) evLCB = pLCB * multEst - 1 // safety gate
+    return res
+  }
+  updateUCB(a, reward){
+    this.t++
+    this.n[a]=(this.n[a]||0)+1
+    this.r[a]=(this.r[a]||0)+reward
+    this.sq[a]=(this.sq[a]||0)+reward*reward
+  }
+}
 
-    const kelly = clamp(kellyFraction(pMean, multEst) * RISK_AVERSION, 0, KELLY_CAP)
+// Regime detector
+class Regime {
+  constructor(thup=3.0, thdn=-3.0){
+    this.g=0; this.G=0; this.thUp=thup; this.thDn=thdn
+    this.lastReset=now()
+    this.mu=0; this.beta=0.02
+    // slow drift
+    this.slow=0; this.betaS=0.004
+  }
+  push(x){ // x: GREEN share - baseline
+    this.mu = (1-this.beta)*this.mu + this.beta*x
+    const z = x - this.mu
+    this.g = Math.max(0, this.g + z)
+    this.G = Math.min(0, this.G + z)
+    let changed=false
+    if(this.g>this.thUp || this.G<this.thDn){ changed=true; this.lastReset=now(); this.g=0; this.G=0 }
+    // drift slow:
+    this.slow = (1-this.betaS)*this.slow + this.betaS*x
+    const drift = Math.abs(this.slow)>0.10
+    return {changed, drift}
+  }
+}
 
-    // ---- SIZING ----
-    let betFactor = EV_GATE_FACTOR
-    let betUsed
-    const rollWins = recentWins.reduce((s,v)=>s+v,0)
-    const rollRate = recentWins.length ? rollWins / recentWins.length : 1
-    const inCooldown = (cooldownLeft > 0) || (recentWins.length >= ROLL_N && rollRate < ROLL_MIN_WINRATE)
-    if (inCooldown) cooldownLeft = Math.max(cooldownLeft, COOLDOWN_ROUNDS)
-    if (inCooldown) reason.push('COOLDOWN')
+/* =============================
+   VOLATILITY & RISK
+============================= */
 
-    if (r <= WARMUP_ROUNDS || evLCB <= 0) {
-      reason.push('EV<=0')
-      betUsed = ABS_SCOUT
-      betFactor = betUsed / baseBet
+class Vol{
+  constructor(n=VOL_WIN){ this.n=n; this.q=[] }
+  push(ret){ this.q.push(ret); if(this.q.length>this.n) this.q.shift() }
+  stdev(){ const N=this.q.length; if(N<2) return 0; const mu=this.q.reduce((a,b)=>a+b,0)/N; const v=this.q.reduce((s,x)=>s+(x-mu)*(x-mu),0)/(N-1); return Math.sqrt(v) }
+}
+
+class RiskManager{
+  constructor(){ this.peak=null; this.bankroll=0; this.pnlSession=0; this.pnlPeak=0 }
+  update(bankroll, pnlSession){
+    if(typeof bankroll==='number'){ this.bankroll=bankroll; if(this.peak===null||bankroll>this.peak) this.peak=bankroll }
+    if(typeof pnlSession==='number'){ this.pnlSession=pnlSession; if(this.pnlSession>this.pnlPeak) this.pnlPeak=this.pnlSession }
+  }
+  ddFrac(){ if(!this.peak) return 0; return (this.bankroll-this.peak)/this.peak } // ≤0 is drawdown
+  throttle(){
+    const f=this.ddFrac()
+    if(f>=-0.03) return 1.00
+    if(f>=-0.06) return 0.88
+    if(f>=-0.10) return 0.75
+    if(f>=-0.16) return 0.60
+    return 0.45
+  }
+}
+
+/* =============================
+   COLOR DECISION
+============================= */
+
+function chooseArm(est, ex, gateMargin){
+  // Expert mixture
+  const mix = est.expertProbs() // length=4
+  // Base assume GREEN unless clear gain
+  let best = 3, why='green-baseline'
+  let bestScore = mix[3]*MULT[3]-1
+
+  // Gate sang màu khác theo EV (dùng LCB protection)
+  for(let a of [0,1,2]){
+    if(a===2 && (est.len()<W_SLOW || est.cnt(2)<GOLD_LOCK.minObs)) continue
+    if(a===0 && (est.len()<W_SLOW || est.cnt(0)<RED_LOCK.minObs)) continue
+    const pLCB = est.wilsonLCB(a)
+    const need = a===2? GOLD_LOCK.minLCB : a===0? RED_LOCK.minLCB : BREAKEVEN[a]+0.002
+    const evLCB = pLCB*MULT[a]-1
+    const evMix = mix[a]*MULT[a]-1
+    if(pLCB>=need && evLCB>0 && evMix >= bestScore + gateMargin){
+      best=a; bestScore=evMix; why=`gate-${IDX2[a]}`
+    }
+  }
+
+  // Explore thận trọng RED/GOLD khi vẫn GREEN
+  if(best===3 && est.len()>WARMUP_UNTIL){
+    const pExp = ex.exp3Prob(), ucb=ex.ucbTuned()
+    let cand=-1, score=-1e9
+    for(let a of [0,2]){
+      const ev = mix[a]*MULT[a]-1 + 0.25*ucb[a] + 0.05*Math.log(1+pExp[a])
+      if(ev>score){ score=ev; cand=a }
+    }
+    if(cand!==-1 && score > bestScore + gateMargin*0.6){
+      best=cand; bestScore=score; why=`explore-${IDX2[cand]}`
+    }
+  }
+  // Nâng/giảm gate nếu streak xanh dài/đỏ dài
+  if(best!==3 && est.greenStreak>=5) { best=3; bestScore=mix[3]*MULT[3]-1; why='green-streak-lock' }
+
+  return { arm:best, evG:mix[3]*MULT[3]-1, evArm:bestScore, why, mix }
+}
+
+/* =============================
+   SIZING (MetaSizer)
+============================= */
+
+const kelly=(p,m)=>{ const num=p*m-1, den=m-1; return den>0? clamp(num/den,0,1):0 }
+
+function dynamicMinBet(bankroll, est){
+  const frac = clamp(P.MIN_FRAC, 0, P.MIN_FRAC_CAP)
+  let b = roundUnit(Math.max(ABS_MIN_BET, bankroll*frac))
+  const n = est.len()
+  if(n>=W_SLOW){
+    const greenRate = est.cnt(3)/n
+    if(greenRate > 0.835){
+      const boost = 1 + 0.14 * Math.min(1, (greenRate-0.805)/0.05)
+      b = roundUnit(b*boost)
+    }
+  }
+  return clamp(b, ABS_MIN_BET, MAX_BET)
+}
+
+class BetGovernor{
+  constructor(){ this.last=null }
+  adjust(proposed){
+    if(this.last==null){ this.last=proposed; return proposed }
+    const up = roundUnit(this.last*1.45)   // tăng tối đa +45%/spin
+    const dn = roundUnit(this.last*0.38)   // giảm tối đa −62%/spin
+    const bounded = clamp(proposed, dn, up)
+    this.last = bounded
+    return bounded
+  }
+}
+
+function metaSizeBet({bankroll, est, arm, pMean, pLCB, m, firewall, vol, rsk, gov, recovState}){
+  bankroll = Math.max(bankroll||0, 1)
+  const minBet = dynamicMinBet(bankroll, est)
+  const breakeven = 1/m
+
+  // Lanes:
+  // 1) Kelly (mean)
+  const fMean  = Math.min(kelly(pMean,m), P.KELLY_CAP)
+  // 2) Kelly (LCB)
+  const fLCB   = Math.min(kelly(pLCB,m), P.KELLY_CAP*0.85)
+  // 3) Risk budget từ EV (LCB):
+  const ev_lcb = Math.max(0, pLCB*m - 1)
+  const riskFrac= clamp(P.RISK_BASE + P.EDGE_BOOST*ev_lcb, 0, P.RISK_CAP)
+  // 4) Volatility scaling
+  const sd = vol.stdev()
+  const volScale = sd > VOL_TARGET ? clamp(VOL_TARGET/(sd+1e-9), 0.33, 1) : 1
+  // 5) Recovery (khôi phục dần dần một phần DD/PnL âm)
+  let recovAdd = 0
+  if(recovState && recovState.runningLoss<0){
+    const cap = bankroll * P.RECOV_CAP_FRAC * fLCB
+    const want = Math.min(cap, Math.abs(recovState.runningLoss)*P.RECOV_GAIN_FRAC)
+    recovAdd = roundUnit(want)
+  }
+
+  // Base stake = bankroll * risk * (blend kelly)
+  const kBlend = Math.max(0.25*fLCB + 0.75*fMean, 0)
+  let stake = bankroll * riskFrac * kBlend
+  // streak boost khi xanh và winStreak kéo dài
+  if(est.winStreak >= STREAK_WIN_BOOST_AFTER && arm===3){
+    stake *= (1 + P.STREAK_WIN_BOOST)
+  }
+  // firewall
+  if(firewall) stake *= FIREWALL_CUT
+  // apply vol
+  stake *= volScale
+
+  // chuyển stake → bet tiền, cộng lane khôi phục
+  let bet = Math.max(minBet, roundUnit(stake) + recovAdd)
+  // drawdown throttle + governor
+  bet = roundUnit(bet * rsk.throttle())
+  bet = gov.adjust(bet)
+
+  return clamp(bet, ABS_MIN_BET, MAX_BET)
+}
+
+/* =============================
+   MAIN LOOP
+============================= */
+
+async function runAccount({ idxAcc, cookie, dispatcher }){
+  console.log(`\n===== ACCOUNT #${idxAcc+1} (v5.0 ${STRATEGY}) =====`)
+  const est = new Ensemble(4, W_FAST, W_SLOW, EMA_A, PRIOR)
+  const vol = new Vol(VOL_WIN)
+  const ex  = new Explorer(4)
+  const reg = new Regime()
+  const rsk = new RiskManager()
+  const gov = new BetGovernor()
+
+  let t=0, pnl=0, lossStreak=0, firewall=0, lastStatus=200
+  let bankroll=null
+  const recents=[]
+  let lastSpinAt = 0
+  let prevLanded = null
+  let gateMargin = BASE_GATE_MARGIN
+
+  // recovery state
+  const recovState = { runningLoss:0 } // âm khi thua chuỗi
+
+  while(true){
+    t++
+    // pacing
+    const nowMs = now()
+    const since = nowMs - lastSpinAt
+    const baseDelay = minDelayFor(lastStatus, same(prevLanded, est.last))
+    const delayNeed = Math.max(baseDelay, BURST_GAP_MS)
+    if(since < delayNeed){
+      await sleep(delayNeed - since + randInt(...JITTER_EXTRA))
+    }
+
+    // choose arm
+    let arm=3, evG=null, evArm=null, why='warmup', mix=[0.25,0.25,0.25,0.25]
+    if(est.len() < WARMUP_UNTIL){ 
+      const mix0=[0.18,0.09,0.08,0.65]; mix=mix0
+      evG = mix0[3]*MULT[3]-1; evArm = evG
     } else {
-      const tier =
-        evLCB > 0.15 ? 1.00 :
-        evLCB > 0.05 ? 0.60 :
-                       0.35
-      const rawFactor = 1 + 0.4*edgeMean + kelly
-      betFactor = clamp(rawFactor * tier, BET_MIN_FACTOR, BET_MAX_FACTOR)
-      if (inCooldown) betFactor = Math.min(betFactor, COOLDOWN_BET_FACTOR)
-      betUsed = Math.max(1, Math.floor(baseBet * betFactor))
-      if (typeof ABS_MAX === 'number') betUsed = Math.min(betUsed, ABS_MAX)
-      betUsed = Math.max(betUsed, Math.min(ABS_SCOUT, baseBet))
+      const res = chooseArm(est, ex, gateMargin)
+      arm=res.arm; evG=res.evG; evArm=res.evArm; why=res.why; mix=res.mix
     }
 
-    // spin
-    const { ok, status, text } = await spinOnce({ cookie, betAmount: betUsed, armIndex: arm, dispatcher })
+    const { p, pLCB, pS } = (()=>{ 
+      const pS = est.pSlow(arm)
+      const pLCB = est.wilsonLCB(arm)
+      // nhẹ nhàng pha theo expert mix để phản ứng nhanh
+      const pBlend = clamp(0.65*pS + 0.35*mix[arm],0,1)
+      return { p:pBlend, pLCB, pS }
+    })()
 
-    // outcome: chỉ lấy landedIndex/màu
-    const outcome = extractOutcomeStrict(text)
-    const landedIndex = outcome.landedIndex
-    const landedName  = outcome.color || (Number.isInteger(landedIndex) ? (INDEX_TO_COLOR[landedIndex] ?? landedIndex) : 'unknown')
+    // sizing (MetaSizer)
+    let bet = metaSizeBet({
+      bankroll, est, arm,
+      pMean:p, pLCB, m:MULT[arm],
+      firewall: firewall>0, vol, rsk, gov, recovState
+    })
 
-    // STRICT: win IFF arm == landedIndex
-    const winnerMatch = Number.isInteger(landedIndex) && landedIndex === arm
-    const payoutUsed  = winnerMatch ? Number((betUsed * multEst).toFixed(2)) : 0
-    const net         = payoutUsed - betUsed
-    pnl += net
-
-    // update model
-    if (Number.isInteger(landedIndex)) ts.updateFromLanded(landedIndex)
-    ts.decay(DECAY)
-
-    // rolling window
-    recentWins.push(winnerMatch ? 1 : 0)
-    if (recentWins.length > ROLL_N) recentWins.shift()
-    if (cooldownLeft > 0) cooldownLeft--
-
-    // row
-    const rowObj = {
-      acc: idxAcc+1, round: r,
-      betBase: baseBet, betUsed, betFactor,
-      index: arm, color,
-      pMean, pLCB, multEst, evLCB, edgeMean,
-      landedName, payoutUsed, net, pnl, status, tags: reason
-    }
-
-    if ((r % logEvery) === 0) {
-      if (uiMode === 'pretty') printer.push(rowObj)
-      else { // clean/plain nếu muốn, vẫn in pretty làm mặc định
-        printer.push(rowObj)
+    // AI advisory (tùy chọn)
+    if (await aiReady()) {
+      const signals = [0,1,2,3].map(a=>{
+        const m=MULT[a], pS=est.pSlow(a), pLCB=est.wilsonLCB(a)
+        return {
+          color:IDX2[a], m, pMean:pS, pLCB,
+          evMean:pS*m-1, evLCB:pLCB*m-1,
+          cnt:est.cnt(a), share: est.len()? est.cnt(a)/est.len():0
+        }
+      })
+      const ctx = {
+        bankroll, minBet: dynamicMinBet(Math.max(1,bankroll||0), est),
+        maxBet: MAX_BET, firewall: firewall>0,
+        volSd: vol.stdev(),
+        greenHeat: est.len()? est.cnt(3)/est.len() : 0,
+        baseGate: BASE_GATE_MARGIN, mode: STRATEGY
+      }
+      const ai = await aiSuggest({ ctx, signals, proposal:{arm, bet, why} })
+      if (ai){
+        const safeSwitch =
+          !(ai.arm===0 && (est.len()<W_SLOW || est.cnt(0)<RED_LOCK.minObs)) &&
+          !(ai.arm===2 && (est.len()<W_SLOW || est.cnt(2)<GOLD_LOCK.minObs))
+        if(safeSwitch){
+          const evNew = signals[ai.arm].evMean
+          const evGre = signals[3].evMean
+          if (evNew >= evGre - 0.003) {
+            arm = ai.arm
+            const scaled = roundUnit(clamp(bet * ai.betMultiplier, ABS_MIN_BET, MAX_BET))
+            if (scaled >= ABS_MIN_BET) bet = gov.adjust(scaled)
+            why += ` | ai(${IDX2[ai.arm]},x${ai.betMultiplier.toFixed(2)})`
+          }
+        }
       }
     }
 
-    // CSV
-    appendLog({
-      round: r,
-      acc: idxAcc+1,
-      betBase: baseBet,
-      betUsed,
-      betFactor,
-      index: arm,
-      color,
-      ok, status,
-      landedIndex,
-      payoutUsed,
-      pMean, pLCB,
-      multEst,
-      evLCB,
-      edgeMean,
-      kelly: clamp(kellyFraction(pMean, multEst) * RISK_AVERSION, 0, KELLY_CAP),
-      net,
-      pnl,
-      reason: reason.join('|'),
-      alpha: ts.getAlpha(),
-      raw: outcome.raw
-    })
+    // API call
+    let res
+    try { res = await spin({ cookie, idx:arm, bet, dispatcher }) }
+    catch(e){ console.log(`[${idxAcc+1}] neterr: ${e?.message||e}`); lastStatus='net'; continue }
+    lastStatus = res.status
 
-    await waitMs(randInt(MIN_DELAY, MAX_DELAY))
-    if (Number.isFinite(roundsLimit) && r >= roundsLimit) break
+    // Parse & settle — FIX: win ONLY if landedIndex === arm
+    const out = extractOutcome(res.parsed)
+    if (typeof out.balance === 'number'){
+      bankroll = Math.max(1, out.balance)
+      rsk.update(bankroll, pnl)
+    }
+    const landed = Number.isInteger(out?.landedIndex) ? out.landedIndex : null
+    const landedName = out?.color || (landed != null ? IDX2[landed] : 'unknown')
+
+    const win = (landed != null) && (landed === arm)
+    const payout = win ? Math.round(bet * MULT[arm]) : 0
+    const net = payout - bet; pnl += net
+
+    // update stats
+    if(landed!=null) est.push(landed, win)
+    est.updateExpertWeights(landed)
+    vol.push((payout - bet)/Math.max(1,bet))
+
+    // explorer feedback
+    const reward = clamp((payout - bet)/Math.max(1,bet), -1, 1)
+    ex.updateExp3(arm, Math.max(0, reward))
+    ex.updateUCB(arm, (reward+1)/2)
+
+    // regime
+    if(landed!=null){
+      const gShare = est.cnt(3)/Math.max(1,est.len())
+      const dev = gShare - 0.70
+      const ch = reg.push(dev)
+      if(ch.changed){
+        console.log(`[${idxAcc+1}] 🔁 regime-change → soft-reset & loosen gate`)
+        est.reset(0.40)
+        gateMargin = Math.max(0.006, gateMargin*0.78)
+      } else {
+        gateMargin = gateMargin*0.985 + BASE_GATE_MARGIN*0.015
+      }
+      if(ch.drift){
+        // drift chậm → giảm nhẹ sức nặng Markov
+        est.expertW.MK1 *= 0.9
+        est.expertW.MK2 *= 0.9
+      }
+    }
+
+    // guards, recovery state
+    if(net<0){ lossStreak++; recovState.runningLoss += net } else { lossStreak=0; recovState.runningLoss = Math.min(0, recovState.runningLoss+net) }
+    if(lossStreak>=MAX_LOSS_STREAK && firewall===0) firewall=FIREWALL_SPINS
+    else if(firewall>0) firewall--
+
+    const recentLen = recents.push(net); if(recentLen>TILT_WINDOW) recents.shift()
+    const dd = recents.reduce((a,b)=>a+b,0)
+    if(dd<=TILT_DD){
+      console.log(`[${idxAcc+1}] ⚠️ tilt-guard DD=${dd} → cooldown ${TILT_COOL_MS}ms`)
+      await sleep(TILT_COOL_MS)
+      lossStreak=0
+      firewall = Math.max(firewall, Math.ceil(FIREWALL_SPINS/2))
+    }
+
+    // log
+    const evShow = ((p*MULT[arm]-1)*100).toFixed(2)
+    const evGShow= ((est.pSlow(3)*MULT[3]-1)*100).toFixed(2)
+    console.log(`[${idxAcc+1}] t=${t} bet=${bet} on ${IDX2[arm]} → ${landedName} | ${win?'WIN':'LOSE'} | net=${net>=0?'+':''}${net} | PnL=${pnl>=0?'+':''}${pnl} | EV(${IDX2[arm]})~${evShow}% EV(G)~${evGShow}%${firewall>0?` | FW:${firewall}`:''}${bankroll?` | bankroll=${Math.round(bankroll)}`:''} | ${why}`)
+
+    if(TAKE_PROFIT!=null && pnl>=TAKE_PROFIT){ console.log('🎯 Take-profit hit.'); break }
+    if(STOP_LOSS!=null   && pnl<=STOP_LOSS){   console.log('🛑 Stop-loss hit.');  break }
+
+    lastSpinAt = now()
+    prevLanded = landed
   }
 }
 
-// ==================== CLI / Main ====================
-async function promptBetIfNeeded() {
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout })
-  const ask = q => new Promise(res => rl.question(q, v => res(v)))
-  let v = await ask(`Nhập số AP để bet (mặc định 1000): `)
-  rl.close()
-  v = v.trim()
-  const n = Number(v || '1000')
-  return (!Number.isFinite(n) || n <= 0) ? 1000 : n
-}
-function parseCli() {
-  const get = (k, d = null) => {
-    const arg = process.argv.find(a => a.startsWith(`--${k}=`))
-    return arg ? arg.split('=')[1] : d
+/* =============================
+   DRIVER
+============================= */
+
+const readLinesMaybe = p => { try{ return readLines(p) }catch{ return [] } }
+
+async function main(){
+  const accs = readLinesMaybe('data.txt').map((line,i)=>({ i, cookie: line.split('\t')[0] }))
+  if(!accs.length){
+    console.error('❌ data.txt is empty or missing. Put one cookie per line.')
+    process.exit(1)
   }
-  const roundsCli = Number(get('rounds', NaN)) // NaN -> infinite
-  const logEvery = Number(get('log-every', 1)) || 1
-  const uiMode  = (get('ui','pretty') || 'pretty').toLowerCase() // pretty|clean (pretty mặc định)
-  return { roundsCli, logEvery, uiMode }
-}
-function parseProxiesSafe() { try { return parseProxies('proxy.txt') } catch { return [] } }
-
-async function main() {
-  ensureLogHeader()
-  const accounts = parseAccounts('data.txt')
-  if (!accounts.length) { console.error('❌ Không tìm thấy tài khoản trong data.txt'); process.exit(1) }
-  const proxies = parseProxiesSafe()
-  const { roundsCli, logEvery, uiMode } = parseCli()
-
-  const allHaveBet = accounts.every(a => Number.isFinite(a.bet) && a.bet > 0)
-  const promptBet = allHaveBet ? null : await promptBetIfNeeded()
-
-  for (let k=0; k<accounts.length; k++){
-    const a = accounts[k]
-    if (!a.cookie){ console.log(`[ACC #${k+1}] thiếu cookie, bỏ qua.`); continue }
-    const baseBet   = Number.isFinite(a.bet) && a.bet > 0 ? a.bet : (promptBet ?? 1000)
-    const baseIndex = Number.isFinite(a.index) ? a.index : NaN
-    const dispatcher = pickProxyAgent(proxies, k) || undefined
-    await runForAccount({ idxAcc:k, cookie:a.cookie, baseBet, baseIndex, roundsLimit: roundsCli, dispatcher, logEvery, uiMode })
+  const proxyList = readLinesMaybe('proxy.txt')
+  for(let i=0;i<accs.length;i++){
+    const dispatcher = proxyList.length? new ProxyAgent(proxyList[i%proxyList.length]) : undefined
+    await runAccount({ idxAcc:i, cookie:accs[i].cookie, dispatcher })
   }
-  console.log('\n✔️ Hoàn tất.')
 }
 main().catch(e=>{ console.error(e); process.exit(1) })
