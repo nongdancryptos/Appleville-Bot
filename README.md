@@ -7,7 +7,7 @@ It **learns real-time probabilities** from API outcomes and **bets intelligently
 > Suggested repo: `https://github.com/nongdancryptos/Appleville-Bot.git`  
 > Files in the repo root:
 >
-> - `spin-pro.js` — the single-file intelligent bot (ESM).
+> - `spin.js` — the single-file intelligent bot (ESM).
 > - `data.txt` — cookies list, one account per line.
 > - `proxy.txt` *(optional)* — proxies list, one per line.
 > - `README.md` — this document.
@@ -69,7 +69,7 @@ npm i undici
 ## 4) Run
 
 ```bash
-node spin-pro
+node spin.js
 ```
 
 - The bot iterates **sequentially** over all accounts in `data.txt`.
