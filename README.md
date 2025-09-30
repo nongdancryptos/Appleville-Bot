@@ -1,79 +1,79 @@
 # Appleville-Bot
 
-Bot “spin” cho tính năng **Wheel Spin** của Appleville.  
-Tập trung **học xác suất realtime** từ kết quả trả về của API và **đặt cược thông minh** dựa trên kỳ vọng (EV) + biên an toàn thống kê.  
-**Không can thiệp hệ thống / RNG** – chỉ tối ưu quyết định theo dữ liệu hợp lệ.
+A smart **Wheel Spin** bot for Appleville.  
+It **learns real-time probabilities** from API outcomes and **bets intelligently** using expected value (EV) with statistical safety margins.  
+**No hacking / RNG tampering** — this bot only optimizes decisions from publicly returned data.
 
-> Repo gợi ý: `https://github.com/nongdancryptos/Appleville-Bot.git`  
-> Các file chính trong thư mục gốc:
+> Suggested repo: `https://github.com/nongdancryptos/Appleville-Bot.git`  
+> Files in the repo root:
 >
-> - `spin-pro.js` – bot thông minh (1 file duy nhất).
-> - `data.txt` – danh sách cookie đăng nhập, mỗi dòng 1 tài khoản.
-> - `proxy.txt` *(tuỳ chọn)* – danh sách proxy, mỗi dòng 1 proxy.
-> - `README.md` – tài liệu này.
+> - `spin-pro.js` — the single-file intelligent bot (ESM).
+> - `data.txt` — cookies list, one account per line.
+> - `proxy.txt` *(optional)* — proxies list, one per line.
+> - `README.md` — this document.
 
 ---
 
-## 1) Yêu cầu
+## 1) Requirements
 
-- **Node.js 18+** (khuyến nghị 20+ hoặc 22+).
-- Kết nối mạng ổn định.
-- Tài khoản Appleville đang đăng nhập được (có cookie `session-token` hợp lệ).
+- **Node.js 18+** (20+/22+ recommended).
+- Stable internet connection.
+- Appleville account with a **valid session cookie**.
 
-> Kiểm tra phiên bản:
+> Check version:
 > ```bash
 > node -v
 > ```
 
 ---
 
-## 2) Cài đặt
+## 2) Installation
 
 ```bash
-# Clone repo
+# Clone the repo
 git clone https://github.com/nongdancryptos/Appleville-Bot.git
 cd Appleville-Bot
 
-# Cài gói cần thiết (chỉ 1 gói)
+# Install dependency (only one)
 npm i undici
 ```
 
-> Repo này dùng ESM (`"type": "module"` trong `package.json`), vì vậy file chính là `spin-pro.js` (không dùng `require`).
+> The repo uses ESM (`"type":"module"` in `package.json`), so the main file is `spin-pro.js` (no `require`).
 
 ---
 
-## 3) Chuẩn bị cấu hình
+## 3) Configuration
 
-### 3.1 `data.txt` (bắt buộc)
+### 3.1 `data.txt` (required)
 
-- Mỗi **dòng** là **cookie đầy đủ** của phiên Appleville (bao gồm `__Host-authjs...`, `session-token=...`).
-- Không có tiêu đề, không khoảng trắng cuối dòng.
-- Ví dụ (rút gọn minh hoạ – **đừng** copy y nguyên):
+- Each **line** is the **full cookie** string of an Appleville session (includes `__Host-authjs...`, `session-token=...`, etc.).  
+- No header, no trailing spaces.
+- Example (shortened — **do not** copy as-is):
   ```
   __Host-authjs.csrf-token=...; __Secure-authjs.callback-url=https%3A%2F%2F0.0.0.0%3A3000; session-token=eyJhbGciOi...
   ```
 
-> Cách nhanh để lấy cookie: đăng nhập Appleville trên trình duyệt → F12 **Network** → request bất kỳ đến `app.appleville.xyz` → tab **Headers** → **Request Headers** → **cookie** → copy toàn bộ.
+> Quick way to get the cookie: Log in to Appleville → open F12 **Network** → pick any request to `app.appleville.xyz` → **Headers** → **Request Headers** → **cookie** → copy the whole value.
 
-### 3.2 `proxy.txt` (tuỳ chọn)
+### 3.2 `proxy.txt` (optional)
 
-- Mỗi dòng một proxy:
+- One proxy per line:
   ```
   http://user:pass@host:port
   http://host:port
   ```
-- Nếu không có file này, bot sẽ gọi trực tiếp (không proxy).
+- If missing, the bot will connect directly.
 
 ---
 
-## 4) Chạy bot
+## 4) Run
 
 ```bash
 node spin-pro
 ```
 
-- Bot sẽ chạy **tuần tự** qua các tài khoản trong `data.txt`.  
-- Mặc định **log từng lệnh** (mỗi vòng quay), ví dụ:
+- The bot iterates **sequentially** over all accounts in `data.txt`.
+- It **logs every spin**, e.g.
 
 ```
 ===== ACCOUNT #1 (pro) =====
@@ -82,69 +82,70 @@ node spin-pro
 ...
 ```
 
-### Tốc độ & backoff
+### Speed & Backoff
 
-- Nhịp bình thường: ~**160–420ms**/lượt.
-- Nếu gặp **429/5xx** (rate limit / server bận), bot **tự giãn nhịp** tạm thời rồi tiếp tục.
-
----
-
-## 5) Cách hoạt động (tóm tắt)
-
-- **Học realtime**:
-  - Cửa sổ **ngắn (W1)** + **trung (W2)**, thêm **EMA** để nhạy mà vẫn ổn định.
-  - Ước lượng xác suất rơi cho từng màu → tính EV = p × payout − 1.
-
-- **Quyết định thông minh**:
-  - **Ensemble** 4 “não”:  
-    **EV-mean**, **EV-upper** (Wilson CI), **Thompson Sampling**, **Markov bậc-1**.
-  - **Gate an toàn**: chỉ rời **GREEN** khi **EV_lcb(color)** > **EV(GREEN)** + **margin** (tránh lao vào RED/GOLD khi dữ liệu mỏng).
-  - **Anti-green**: nếu EV(GREEN) âm kéo dài, bot ưu tiên BLUE (khi có edge).
-
-- **Quản trị rủi ro**:
-  - **Kelly 1/4** + **auto-ramp theo EV**, nắp bet `[MIN_BET, MAX_BET]`.
-  - **Volatility targeting** (giảm bet khi biến động cao).
-  - **Firewall** khi thua liên tiếp; **tilt-guard** khi drawdown ngắn hạn lớn (cooldown ngắn, co bet).
-
-> **Lưu ý quan trọng**: Theo bảng odds **chính thức** (RED 0.5%, GOLD 4%, BLUE 15%, GREEN 80.5% với payout [150x, 20x, 5x, 1.15x]) thì **tất cả cửa đều âm EV**; nhỏ nhất là **GREEN (~-7.4%)**. Bot chỉ **tăng cược** khi dữ liệu quan sát cho thấy một cửa nào đó có **edge dương có ý nghĩa** (biên dưới Wilson vượt mốc hoà vốn). Nếu không có edge, bot sẽ duy trì **minbet** để giảm lỗ kỳ vọng.
+- Normal pace: **~160–420 ms** per spin.  
+- On **429/5xx** (rate-limit/server busy), the bot **backs off** briefly, then resumes.
 
 ---
 
-## 6) Cấu trúc file
+## 5) How it works (short)
+
+- **Real-time learning**
+  - Two rolling windows: **short (W1)** and **medium (W2)** plus **EMA** for responsiveness and stability.
+  - Estimates per-color probabilities → computes **EV = p × payout − 1**.
+
+- **Smart decision making**
+  - **Ensemble** of four “brains”:
+    - **EV-mean**, **EV-upper** (Wilson CI), **Thompson Sampling**, **1st‑order Markov** (next given previous).
+  - **Safety gate**: only leaves **GREEN** if **EV_lcb(color)** > **EV(GREEN)** + margin (prevents chasing RED/GOLD with thin data).
+  - **Anti-green**: if EV(GREEN) stays negative for a while, favor **BLUE** when it shows an edge.
+
+- **Risk management**
+  - **Quarter‑Kelly** betting with capped size and **auto‑ramp** by EV.
+  - **Volatility targeting** (downsize on high variance).
+  - **Firewall** after loss streak; **tilt‑guard** for short‑term drawdown (cooldown + reduced bet).
+
+> **Important**: With the official odds (RED 0.5%, GOLD 4%, BLUE 15%, GREEN 80.5% and payouts [150x, 20x, 5x, 1.15x]), **all choices are negative EV**; the least negative is **GREEN (~‑7.4%)**. The bot only **increases stake** when observed data shows a **statistically meaningful positive edge** (Wilson LCB exceeds the break‑even probability). Otherwise it reverts to **minbet** to lower expected loss.
+
+---
+
+## 6) Layout
 
 ```
 Appleville-Bot/
-├─ spin-pro.js        # file chạy chính (ESM)
-├─ data.txt           # cookie mỗi dòng 1 tài khoản
-├─ proxy.txt          # (tuỳ chọn) proxy mỗi dòng 1 proxy
-└─ README.md          # tài liệu này
+├─ spin-pro.js        # main runner (ESM)
+├─ data.txt           # cookies, one per account
+├─ proxy.txt          # optional proxies
+└─ README.md          # this file
 ```
 
 ---
 
-## 7) Câu hỏi thường gặp
+## 7) FAQ
 
-**Q1. Bot có “hack” hệ thống không?**  
-Không. Bot chỉ đọc phản hồi hợp lệ từ API public của ứng dụng, học tần suất rơi thực tế và ra quyết định đặt cược dựa trên EV + thống kê.
+**Q1. Does the bot hack the system or RNG?**  
+No. It only consumes valid API responses and makes decisions from observed outcomes.
 
-**Q2. Vì sao vẫn có thể thua?**  
-Vì house edge âm theo thiết kế trò chơi. Bot chỉ giúp **giảm thua kỳ vọng** và **tăng kỷ luật giao dịch**; không thể đảm bảo lợi nhuận dài hạn nếu xác suất thực đúng như bảng.
+**Q2. Why can it still lose?**  
+Because the game is house‑edge negative by design. The bot reduces expected loss and enforces discipline; it cannot guarantee profit if the true odds match the official table.
 
-**Q3. Chạy nhiều tài khoản cùng lúc được không?**  
-File hiện chạy tuần tự qua từng dòng trong `data.txt`. Bạn có thể mở nhiều tiến trình `node spin-pro` trên máy/VM/proxy khác nhau.
-
+**Q3. Can I run multiple accounts in parallel?**  
+This script runs accounts sequentially from `data.txt`. You can start multiple OS processes/VMs with different proxies if you need true parallelism.
 ---
-
-## 8) Giấy phép
-
-Mã nguồn phục vụ mục đích học thuật và thử nghiệm. Sử dụng chịu rủi ro của bạn. Không chịu trách nhiệm cho các thiệt hại trực tiếp hoặc gián tiếp phát sinh.
-
----
-
-## 9) Góp ý / Liên hệ
-
-Tạo issue/pull request trên GitHub repo của bạn: `nongdancryptos/Appleville-Bot`.
+## Donate:
 <!-- Code display (SVG) -->
 <p align="center">
   <img src="https://raw.githubusercontent.com/nongdancryptos/nongdancryptos/refs/heads/main/QR-Code/readme.svg" alt="Donation Wallets (SVG code card)" />
 </p>
+---
+
+## 8) License
+
+For educational/testing purposes only. Use at your own risk. No liability for direct or indirect damages.
+
+---
+
+## 9) Feedback
+
+Open an issue or PR on your GitHub repo: `nongdancryptos/Appleville-Bot`.
