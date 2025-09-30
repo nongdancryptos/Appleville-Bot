@@ -1,279 +1,567 @@
-// spin-pro.js — FIXED (ESM)
-// npm i undici
+// spin.js v2.7 (STRICT) — Win IFF pickColor == landedColor; PnL = payoutOr0 - bet; infinite run; colored logs
+// by CQ
 
 import fs from 'fs'
+import readline from 'readline'
 import { fetch, ProxyAgent } from 'undici'
 
-// ================== Endpoint ==================
+// ==================== CONFIG ====================
 const BASE_URL = 'https://app.appleville.xyz'
 const ENDPOINT = `${BASE_URL}/api/trpc/cave.wheelSpin.spin?batch=1`
 
-// Index ↔ Color (theo payload: GREEN=3)
-const INDEX_TO_COLOR = ['RED','BLUE','GOLD','GREEN']
-const COLOR_TO_INDEX = { RED:0, BLUE:1, GOLD:2, YELLOW:2, GREEN:3 }
+const INDEX_TO_COLOR = ['RED', 'BLUE', 'GOLD', 'GREEN']
+const COLOR_TO_INDEX = { RED: 0, BLUE: 1, GOLD: 2, YELLOW: 2, GREEN: 3 }
 
-// ===== Payout & (tham chiếu) Odds =====
-const MULT = [150, 5, 20, 1.15]          // payout mapping cố định theo màu BẠN ĐÃ BET
-const BREAKEVEN = MULT.map(m => 1/m)     // p* để EV=0
+// Payout fixed đúng theo ảnh
+const MULTIPLIERS = [150, 5, 20, 1.15]
 
-// ===== Tuning an toàn =====
-const BASE_BET   = 1000
-const MIN_BET    = 100
-const MAX_BET    = 4000
-const KELLY_FRAC = 0.25
+// Prior theo odds đúng theo ảnh
+const PRIOR_ODDS = [0.005, 0.15, 0.04, 0.805] // [RED, BLUE, GOLD, GREEN]
+const PRIOR_STRENGTH = 2000 // Số "mẫu ảo"
 
-const W1 = 60    // short window
-const W2 = 260   // medium window
-const EMA_A = 0.06
-const Z_LCB = 2.58    // 99% LCB để “chắc kèo”
-const Z_UCB = 2.33
+// Học phân phối (soft) để thích nghi nhẹ
+const WARMUP_ROUNDS  = 24
+const DECAY          = 0.99995
 
-const GATE_MARGIN = 0.008      // phải vượt EV(GREEN)+0.8% mới rời GREEN
-const GOLD_LOCK   = {          // KHÓ mở GOLD/RED
-  minSamples: 120,             // cần >= 120 quan sát trong w2
-  extraLCB:   0.015            // LCB(color) phải > p* + 1.5%
-}
-const RED_LOCK = { minSamples: 180, extraLCB: 0.02 }
+// Exploration
+const EPS_START = 0.03
+const EPS_END   = 0.01
+function epsAtRound(r){ return Math.max(EPS_END, EPS_START * Math.exp(-r/400)) }
 
-const DELAY_FAST    = [160, 420]
-const DELAY_BACKOFF = [2200, 4200]
+// Sizing tương đối
+const KELLY_CAP       = 0.15
+const BET_MIN_FACTOR  = 0.30
+const BET_MAX_FACTOR  = 1.10
+const RISK_AVERSION   = 0.75
 
-// Rủi ro
-const MAX_LOSS_STREAK = 3
-const FIREWALL_SPINS  = 10
-const FIREWALL_CUT    = 0.35
-const VOL_WIN         = 120
-const VOL_TARGET      = 0.14
-const TILT_WINDOW     = 30
-const TILT_DD         = -6000
-const TILT_COOL_MS    = 4000
+// Sizing tuyệt đối — tránh “bet to là thua”
+const ABS_SCOUT = 1000    // mức thăm dò cố định khi EV<=0/cooldown
+const ABS_MAX   = 6000    // trần tuyệt đối cho 1 lệnh
 
-// Stop/Take (tùy chọn)
-const TAKE_PROFIT = null
-const STOP_LOSS   = null
+// Cooldown & gate
+const EV_GATE_FACTOR      = 0.20
+const ROLL_N              = 40
+const ROLL_MIN_WINRATE    = 0.28
+const COOLDOWN_ROUNDS     = 20
+const COOLDOWN_BET_FACTOR = 0.25
 
-const LOG_EVERY = 1
+// HTTP
+const MIN_DELAY = 900
+const MAX_DELAY = 2200
+const RETRIES   = 3
+const BACKOFF_BASE = 600
 
-// ================== Utils ==================
-const sleep   = ms => new Promise(r=> setTimeout(r, ms))
+// Log
+const LOG_FILE = 'spin-log.csv'
+// =================================================
+
+const waitMs = (ms) => new Promise(r => setTimeout(r, ms))
 const randInt = (a,b)=> Math.floor(Math.random()*(b-a+1))+a
-const clamp   = (x,lo,hi)=> Math.max(lo, Math.min(hi, x))
 
-const readLines = p => fs.existsSync(p)
-  ? fs.readFileSync(p,'utf8').split(/\r?\n/).map(s=>s.trim()).filter(Boolean)
-  : []
+// ===== CSV / number fmt =====
+function csv(v){ if (v==null) return ''; const s=String(v); return /[",\n]/.test(s)?`"${s.replace(/"/g,'""')}"`:s }
+const nf = (n,d=4)=> (typeof n==='number' && isFinite(n)) ? Number(n).toFixed(d) : ''
+const ni = (n)=> (typeof n==='number' && isFinite(n)) ? Math.round(n) : ''
+const pfx = (n)=> (n>=0?`+${n}`:`${n}`)
 
-const loadAccounts = ()=> readLines('data.txt').map((line,i)=>({ i, cookie: line.split('\t')[0] }))
-const loadProxies  = ()=> readLines('proxy.txt')
-const pickProxy    = (list,i)=> list.length? new ProxyAgent(list[i%list.length]): undefined
-
-const headersFor = (cookie)=> ({
-  'accept':'*/*',
-  'content-type':'application/json',
-  'cookie':cookie,
-  'origin':BASE_URL,
-  'referer':`${BASE_URL}/`,
-  'trpc-accept':'application/jsonl',
-  'user-agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36',
-  'x-client-version':'1.0.0',
-  'x-trpc-source':'nextjs-react',
-})
-const bodyFor = (idx,bet)=> JSON.stringify({'0':{json:{selectedIndex:idx, betAmount:bet}}})
-
-function parseJSON(text){
-  try { return JSON.parse(text) } catch {
-    const arr = text.split('\n').filter(Boolean)
-    if(arr.length===1){ try{return JSON.parse(arr[0])}catch{return text} }
-    return arr.map(l=>{ try{return JSON.parse(l)}catch{return{raw:l}} })
-  }
-}
-
-// ---- Robust extractor (lấy cả isWin) ----
-function extractOutcome(raw){
-  const hunt = (x)=>{
-    if(!x||typeof x!=='object') return null
-    if('winningIndex'in x||'winningColor'in x||'isWin'in x||'winAmount'in x||'resultIndex'in x) return x
-    if(Array.isArray(x)){ for(const it of x){ const f=hunt(it); if(f) return f } return null }
-    for(const k of Object.keys(x)){ const f=hunt(x[k]); if(f) return f }
-    return null
-  }
-  const n = hunt(raw) || (Array.isArray(raw)? raw.at(-1) : raw)
-  const landedIndex = (typeof n?.winningIndex==='number') ? n.winningIndex
-                    : (typeof n?.resultIndex==='number') ? n.resultIndex
-                    : undefined
-  const color = typeof n?.winningColor==='string'
-      ? n.winningColor.toUpperCase()
-      : (typeof landedIndex==='number' ? INDEX_TO_COLOR[landedIndex] : undefined)
-  const isWin = typeof n?.isWin === 'boolean' ? n.isWin : undefined
-  const winAmount = typeof n?.winAmount==='number' ? n.winAmount : undefined
-  const balance   = typeof n?.newBalance==='number' ? n.newBalance : undefined
-  return { landedIndex, color, isWin, winAmount, balance, raw:n||raw }
-}
-
-async function spin({cookie, idx, bet, dispatcher}){
-  const res = await fetch(ENDPOINT, {
-    method:'POST',
-    headers: headersFor(cookie),
-    body: bodyFor(idx,bet),
-    dispatcher
+// ===== IO =====
+function parseAccounts(file = 'data.txt') {
+  if (!fs.existsSync(file)) return []
+  const lines = fs.readFileSync(file, 'utf8').split(/\r?\n/).map(s => s.trim()).filter(Boolean)
+  return lines.map((line, i) => {
+    const parts = line.split('\t')
+    const cookie = parts[0]
+    const bet = Number(parts[1] ?? NaN)
+    const index = Number(parts[2] ?? NaN)
+    return { i, cookie, bet, index }
   })
-  const text = await res.text()
-  return { ok:res.ok, status:res.status, parsed:parseJSON(text) }
+}
+function parseProxies(file = 'proxy.txt') {
+  if (!fs.existsSync(file)) return []
+  return fs.readFileSync(file, 'utf8').split(/\r?\n/).map(s => s.trim()).filter(Boolean)
+}
+function pickProxyAgent(proxies, i) {
+  if (!proxies.length) return null
+  const url = proxies[i % proxies.length]
+  try { return new ProxyAgent(url) } catch { return null }
 }
 
-// ================== Stats (2 cửa sổ + EMA) ==================
-class DualWindow {
-  constructor(k=4, n1=W1, n2=W2, alpha=EMA_A){
-    this.k=k
-    this.n1=n1; this.q1=[]; this.c1=Array(k).fill(0)
-    this.n2=n2; this.q2=[]; this.c2=Array(k).fill(0)
-    this.ema=Array(k).fill(0); this.a=alpha
-  }
-  push(i){
-    if(typeof i!=='number') return
-    this.q1.push(i); this.c1[i]++; if(this.q1.length>this.n1){ const o=this.q1.shift(); this.c1[o]-- }
-    this.q2.push(i); this.c2[i]++; if(this.q2.length>this.n2){ const o=this.q2.shift(); this.c2[o]-- }
-    for(let a=0;a<this.k;a++){ this.ema[a] = this.a*(a===i?1:0) + (1-this.a)*this.ema[a] }
-  }
-  total(){ return this.q2.length }
-  p1(a){ const N=this.q1.length||1; const freq=this.c1[a]/N; return clamp(0.7*freq+0.3*this.ema[a],0,1) }
-  p2(a){ const N=this.q2.length||1; const freq=this.c2[a]/N; return clamp(0.8*freq+0.2*this.ema[a],0,1) }
-  count2(a){ return this.c2[a] }
-  wilsonLCB(a, z=Z_LCB){
-    const n=this.q2.length; if(n<=0) return 0
-    const x=this.c2[a]; const ph=x/n; const den=1+z*z/n
-    const center=(ph+z*z/(2*n))/den
-    const delta=z*Math.sqrt((ph*(1-ph)+z*z/(4*n))/n)/den
-    return clamp(center-delta,0,1)
-  }
-  wilsonUCB(a, z=Z_UCB){
-    const n=this.q2.length; if(n<=0) return 1
-    const x=this.c2[a]; const ph=x/n; const den=1+z*z/n
-    const center=(ph+z*z/(2*n))/den
-    const delta=z*Math.sqrt((ph*(1-ph)+z*z/(4*n))/n)/den
-    return clamp(center+delta,0,1)
+function headersFor(cookie) {
+  return {
+    'accept': '*/*',
+    'content-type': 'application/json',
+    'cookie': cookie,
+    'origin': BASE_URL,
+    'referer': `${BASE_URL}/`,
+    'trpc-accept': 'application/jsonl',
+    'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36',
+    'x-client-version': '1.0.0',
+    'x-trpc-source': 'nextjs-react',
   }
 }
+const buildBody = (idx, bet)=> JSON.stringify({ '0': { json: { selectedIndex: idx, betAmount: bet } } })
 
-// Volatility tracker
-class Vol {
-  constructor(n=VOL_WIN){ this.n=n; this.q=[] }
-  push(ret){ this.q.push(ret); if(this.q.length>this.n) this.q.shift() }
-  stdev(){ const N=this.q.length; if(N<2) return 0; const mu=this.q.reduce((a,b)=>a+b,0)/N; const v=this.q.reduce((s,x)=>s+(x-mu)*(x-mu),0)/(N-1); return Math.sqrt(v) }
+// ===== Parse response (robust JSONL) =====
+function parseJsonlCandidates(text){
+  const lines = String(text).split('\n').filter(Boolean)
+  const objs = []
+  for (const line of lines){
+    try { objs.push(JSON.parse(line)) } catch {}
+  }
+  if (!objs.length){
+    try { objs.push(JSON.parse(text)) } catch {}
+  }
+  return objs
+}
+function huntCandidates(x, acc=[]){
+  if (!x || typeof x !== 'object') return acc
+  const has = ('winningIndex' in x) || ('resultIndex' in x) || ('winAmount' in x) ||
+              ('payout' in x) || ('isWin' in x) || ('winningColor' in x)
+  if (has) acc.push(x)
+  if (Array.isArray(x)){
+    for (const it of x) huntCandidates(it, acc)
+  } else {
+    for (const k of Object.keys(x)) huntCandidates(x[k], acc)
+  }
+  return acc
+}
+function scoreOutcomeNode(n){
+  let sc = 0
+  if ('winningIndex' in n) sc += 3
+  if ('resultIndex'  in n) sc += 2
+  if ('winningColor' in n) sc += 2
+  if ('isWin'        in n) sc += 1
+  if ('winAmount'    in n) sc += 2
+  if ('payout'       in n) sc += 2
+  return sc
+}
+function extractOutcomeStrict(text){
+  const roots = parseJsonlCandidates(text)
+  const all = []
+  for (const r of roots) huntCandidates(r, all)
+  if (!all.length) return { landedIndex: undefined, color: undefined, raw: roots[roots.length-1] ?? text }
+
+  let best = null, bestScore = -1
+  for (const c of all){
+    const s = scoreOutcomeNode(c)
+    if (s >= bestScore){ bestScore = s; best = c }
+  }
+
+  const landedIndex =
+    (typeof best?.winningIndex === 'number' ? best.winningIndex : undefined) ??
+    (typeof best?.resultIndex  === 'number' ? best.resultIndex  : undefined)
+  const color = (typeof best?.winningColor === 'string' ? best.winningColor.toUpperCase() : undefined)
+
+  return { landedIndex, color, raw: best }
 }
 
-// ================== Decision & Bet ==================
-function kellyFraction(p,m){ const num=p*m-1, den=m-1; return den>0? clamp(num/den,0,1):0 }
+// ===== Math utils =====
+function gammaSample(shape){
+  if (shape < 1) { const u = Math.random(); return gammaSample(shape + 1) * Math.pow(u, 1/shape) }
+  const d = shape - 1/3, c = 1/Math.sqrt(9*d)
+  while (true){
+    let x, v
+    do {
+      const u1 = Math.random(), u2 = Math.random()
+      const z = Math.sqrt(-2*Math.log(u1)) * Math.cos(2*Math.PI*u2)
+      x = z; v = 1 + c*x
+    } while (v <= 0)
+    v = v*v*v
+    const u = Math.random()
+    if (u < 1 - 0.0331 * (x*x)*(x*x)) return d*v
+    if (Math.log(u) < 0.5*x*x + d*(1 - v + Math.log(v))) return d*v
+  }
+}
+function dirichletSample(alpha){
+  const g = alpha.map(a => gammaSample(Math.max(1e-6, a)))
+  const s = g.reduce((x,y)=>x+y,0) || 1
+  return g.map(v=>v/s)
+}
 
-function chooseArm(est){
-  // baseline: GREEN theo p1 (phản ứng nhanh)
-  const evG = est.p1(3)*MULT[3]-1
+// ===== Prior từ odds =====
+function priorFromOdds(odds, S0=PRIOR_STRENGTH){
+  return odds.map(p => Math.max(1, p * S0))
+}
 
-  // LCB & EV_lcb cho từng màu (w2)
-  const LCB = [0,1,2,3].map(a => est.wilsonLCB(a))
-  const EVl = LCB.map((p,a)=> p*MULT[a]-1)
+// ===== Dirichlet TS (không học multiplier) =====
+class DirichletTS {
+  constructor(K, initAlpha=1){
+    this.K = K
+    this.alpha = Array(K).fill(initAlpha)
+  }
+  setAlpha(a){ if (Array.isArray(a) && a.length===this.K) this.alpha = a.slice() }
+  decay(f=DECAY){ for (let i=0;i<this.K;i++) this.alpha[i] = Math.max(1, this.alpha[i]*f) }
+  updateFromLanded(idx){ if (Number.isInteger(idx) && idx>=0 && idx<this.K) this.alpha[idx] += 1 }
+  postMean(){ const S = this.alpha.reduce((s,v)=>s+v,0); return this.alpha.map(a=>a/S) }
+  getAlpha(){ return this.alpha.slice() }
 
-  // Gating: chỉ rời GREEN khi EV_lcb(color) > EV(GREEN)+margin
-  let best=3, bestScore=evG
-  for(let a=0;a<4;a++){
-    if(a===3) continue
-    let needLCB = BREAKEVEN[a] + 0.002 // +0.2% buffer
-    let needSamples = 0
-    if(a===2){ // GOLD: đòi hỏi rất chặt
-      needLCB      = BREAKEVEN[a] + GOLD_LOCK.extraLCB
-      needSamples  = GOLD_LOCK.minSamples
-      if(est.count2(a) < needSamples) continue
+  static pLCB(alpha, i, z=2.33){
+    const S = alpha.reduce((s,v)=>s+v,0)
+    const ai = alpha[i]
+    const mean = ai / S
+    const v = (ai * (S - ai)) / (S*S*(S+1))
+    const sd = Math.sqrt(Math.max(1e-12, v))
+    return { mean, var:v, sd, lcb: Math.max(0, mean - z*sd) }
+  }
+
+  chooseArmLCB(epsilon = 0.01, mults = MULTIPLIERS){
+    if (Math.random() < epsilon) return { arm: randInt(0,this.K-1), ev: null, lcb: null, mean: null, v:null }
+    const a = this.alpha
+    let best = 0, bestScore = -Infinity, bestLCB=0, bestMean=0, bestVar=0
+    for (let k=0;k<this.K;k++){
+      const {mean, var:v, lcb} = DirichletTS.pLCB(a, k, 2.33)
+      const ev = lcb * mults[k] - 1
+      if (ev > bestScore){ bestScore = ev; best = k; bestLCB=lcb; bestMean=mean; bestVar=v }
     }
-    if(a===0){ // RED: siêu chặt
-      needLCB      = BREAKEVEN[a] + RED_LOCK.extraLCB
-      needSamples  = RED_LOCK.minSamples
-      if(est.count2(a) < needSamples) continue
+    return { arm: best, ev: bestScore, lcb: bestLCB, mean: bestMean, v: bestVar }
+  }
+}
+
+// Kelly
+function kellyFraction(p, mult){
+  const b = Math.max(1e-9, mult - 1), q = 1 - p
+  return Math.max(0, (b*p - q)/b)
+}
+function clamp(x,lo,hi){ return Math.min(hi, Math.max(lo,x)) }
+
+// ===== HTTP =====
+async function spinOnce({ cookie, betAmount, armIndex, dispatcher }) {
+  const headers = headersFor(cookie)
+  const body = buildBody(armIndex, betAmount)
+  for (let t=0; t<=RETRIES; t++){
+    try{
+      const res = await fetch(ENDPOINT, { method:'POST', headers, body, dispatcher })
+      const text = await res.text()
+      return { ok: res.ok, status: res.status, text, attempt: t+1 }
+    }catch(e){
+      if (t === RETRIES) throw e
     }
-    const cand = EVl[a]
-    if(LCB[a] >= needLCB && cand > 0 && cand >= evG + GATE_MARGIN){
-      if(cand > bestScore){ bestScore=cand; best=a }
+    await waitMs(BACKOFF_BASE * Math.pow(2,t) + randInt(0,300))
+  }
+  return { ok:false, status:0, text:'', attempt:RETRIES+1 }
+}
+
+// ===== CSV header =====
+function ensureLogHeader(){
+  if (!fs.existsSync(LOG_FILE)){
+    fs.writeFileSync(LOG_FILE,
+      [
+        'ts','round','acc','bet_base','bet_used','bet_factor','index','color',
+        'ok','status','landedIndex','payout_used',
+        'p_mean','p_lcb','mult_est','EV_LCB','edge_mean',
+        'kelly','net','pnl','reason','alpha','raw'
+      ].join(',')+'\n'
+    )
+  }
+}
+function appendLog(row){
+  const line = [
+    csv(new Date().toISOString()),
+    csv(row.round),
+    csv(row.acc),
+    csv(row.betBase),
+    csv(row.betUsed),
+    csv(nf(row.betFactor,6)),
+    csv(row.index),
+    csv(row.color),
+    csv(row.ok),
+    csv(row.status),
+    csv(row.landedIndex ?? ''),
+    csv(row.payoutUsed ?? ''),
+    csv(nf(row.pMean,6)),
+    csv(nf(row.pLCB,6)),
+    csv(nf(row.multEst,6)),
+    csv(nf(row.evLCB,6)),
+    csv(nf(row.edgeMean,6)),
+    csv(nf(row.kelly,6)),
+    csv(row.net),
+    csv(row.pnl),
+    csv(row.reason),
+    csv(JSON.stringify(row.alpha)),
+    csv(JSON.stringify(row.raw))
+  ].join(',')+'\n'
+  fs.appendFileSync(LOG_FILE, line)
+}
+
+// ======================= UI LAYER =======================
+// ANSI colors + backgrounds
+const C = {
+  none: s=>s,
+  bold:  s=>`\x1b[1m${s}\x1b[0m`,
+  red:   s=>`\x1b[31m${s}\x1b[0m`,
+  green: s=>`\x1b[32m${s}\x1b[0m`,
+  yellow:s=>`\x1b[33m${s}\x1b[0m`,
+  blue:  s=>`\x1b[34m${s}\x1b[0m`,
+  bgRed:    s=>`\x1b[41m\x1b[97m${s}\x1b[0m`,
+  bgBlue:   s=>`\x1b[44m\x1b[97m${s}\x1b[0m`,
+  bgYellow: s=>`\x1b[43m\x1b[30m${s}\x1b[0m`,
+  bgGreen:  s=>`\x1b[42m\x1b[30m${s}\x1b[0m`,
+}
+const ANSI_RE = /\x1B\[[0-9;]*m/g
+const stripAnsi = s => String(s).replace(ANSI_RE, '')
+const visLen = s => stripAnsi(s).length
+function truncAnsi(s, width){
+  s = String(s)
+  if (visLen(s) <= width) return s
+  const ell = '…'
+  const target = Math.max(0, width - ell.length)
+  let out = '', v = 0
+  for (let i=0;i<s.length;i++){
+    const ch = s[i]
+    if (ch === '\x1b'){
+      const m = s.slice(i).match(/^\x1B\[[0-9;]*m/)
+      if (m){ out += m[0]; i += m[0].length-1; continue }
+    }
+    if (v < target){ out += ch; v++ } else break
+  }
+  return out + ell
+}
+function padAnsi(s, width, align='left'){
+  s = String(s)
+  const pad = Math.max(0, width - visLen(s))
+  if (align === 'right') return ' '.repeat(pad) + s
+  if (align === 'center') { const l = Math.floor(pad/2), r = pad - l; return ' '.repeat(l) + s + ' '.repeat(r) }
+  return s + ' '.repeat(pad)
+}
+
+// Column widths
+const COL = {
+  round: 8,  pick: 6,  color: 7,  p: 7,  lcb: 7,
+  mult: 6,   EV: 7,    edge: 7,   baseUsed: 18,
+  landed: 8, payout: 10, net: 10,  pnl: 12, tags: 24
+}
+function colorChip(name, bg=false){
+  const up = String(name||'').toUpperCase()
+  if (!bg){
+    if (up==='RED')   return C.red(up)
+    if (up==='BLUE')  return C.blue(up)
+    if (up==='GOLD')  return C.yellow(up)
+    if (up==='GREEN') return C.green(up)
+    return up
+  }
+  if (up==='RED')   return C.bgRed(up)
+  if (up==='BLUE')  return C.bgBlue(up)
+  if (up==='GOLD')  return C.bgYellow(up)
+  if (up==='GREEN') return C.bgGreen(up)
+  return up
+}
+function makeHeader(sep=' │ '){
+  return [
+    ['r',COL.round,'right'], ['pick',COL.pick], ['color',COL.color],
+    ['p',COL.p,'right'], ['lcb',COL.lcb,'right'], ['mult',COL.mult,'right'],
+    ['EV',COL.EV,'right'], ['edge',COL.edge,'right'],
+    ['base->used',COL.baseUsed], ['landed',COL.landed],
+    ['payoutUsed',COL.payout,'right'], ['net',COL.net,'right'], ['pnl',COL.pnl,'right'],
+    ['tags',COL.tags]
+  ].map(([t,w,a])=> padAnsi(t,w,a)).join(' │ ')
+}
+function makeRow(o, sep=' │ '){
+  const evTxt   = (o.evLCB<=0 ? C.red(nf(o.evLCB,4)) : C.green(nf(o.evLCB,4)))
+  const edgeTxt = (o.edgeMean<=0 ? C.red(nf(o.edgeMean,4)) : C.green(nf(o.edgeMean,4)))
+  const netTxt  = (o.net>=0 ? C.green(pfx(ni(o.net))) : C.red(pfx(ni(o.net))))
+  const pnlTxt  = (o.pnl>=0 ? C.green(pfx(ni(o.pnl))) : C.red(pfx(ni(o.pnl))))
+  const pickTxt   = colorChip(o.color, true)
+  const landedTxt = colorChip(o.landedName, true)
+  const tags = (o.tags||[]).join('|')
+
+  const cells = [
+    padAnsi(`${o.round}`, COL.round, 'right'),
+    padAnsi(o.index,                  COL.pick,  'right'),
+    padAnsi(pickTxt,                  COL.color),
+    padAnsi(nf(o.pMean,4),            COL.p,     'right'),
+    padAnsi(nf(o.pLCB,4),             COL.lcb,   'right'),
+    padAnsi(nf(o.multEst,3),          COL.mult,  'right'),
+    padAnsi(evTxt,                    COL.EV,    'right'),
+    padAnsi(edgeTxt,                  COL.edge,  'right'),
+    padAnsi(`${o.betBase}->${o.betUsed}(${nf(o.betFactor,2)})`, COL.baseUsed),
+    padAnsi(truncAnsi(landedTxt, COL.landed), COL.landed),
+    padAnsi(nf(o.payoutUsed,2),       COL.payout,'right'),
+    padAnsi(netTxt,                   COL.net,   'right'),
+    padAnsi(pnlTxt,                   COL.pnl,   'right'),
+    padAnsi(truncAnsi(tags, COL.tags),COL.tags)
+  ]
+  return cells.join(sep)
+}
+const HR = (h)=> '─'.repeat(h.length)
+function createPrettyPrinter(repeatHeaderEvery=25){
+  let n=0
+  const header = makeHeader(' │ ')
+  const line = HR(header)
+  return {
+    push(row){
+      if (n % repeatHeaderEvery === 0){ console.log(line); console.log(header); console.log(line) }
+      console.log(makeRow(row, ' │ '))
+      n++
     }
   }
-  return { arm: best, evG, evArm: (best===3? evG: EVl[best]) }
 }
 
-function betSize(pEst, arm, firewall, vol){
-  const ev=pEst*MULT[arm]-1
-  const k = kellyFraction(pEst, MULT[arm])
-  let b = Math.max(MIN_BET, Math.round(BASE_BET * Math.max(0.05, Math.min(KELLY_FRAC, k))))
-  if (ev>0){ const factor = clamp(1+10*ev, 1, MAX_BET/BASE_BET); b = Math.round(clamp(b*factor, MIN_BET, MAX_BET)) }
-  else { b = Math.max(MIN_BET, Math.round(b*0.5)) }
-  if (firewall) b = Math.max(MIN_BET, Math.round(b*FIREWALL_CUT))
-  const sd=vol.stdev(); if(sd>VOL_TARGET){ const scale=clamp(VOL_TARGET/(sd+1e-9),0.4,1); b=Math.max(MIN_BET, Math.round(b*scale)) }
-  return b
-}
-const nextDelay = (s)=> String(s||'').startsWith('429')||String(s||'').startsWith('5') ? randInt(...DELAY_BACKOFF) : randInt(...DELAY_FAST)
+// ==================== RUN 1 ACCOUNT (INFINITE) ====================
+async function runForAccount({ idxAcc, cookie, baseBet, baseIndex, roundsLimit, dispatcher, logEvery, uiMode }) {
+  console.log(`\n===== ACCOUNT #${idxAcc + 1} =====`)
+  const ts = new DirichletTS(4)
+  ts.setAlpha(priorFromOdds(PRIOR_ODDS, PRIOR_STRENGTH))
 
-// ================== Main loop ==================
-async function runAccount({ idxAcc, cookie, dispatcher }){
-  console.log(`\n===== ACCOUNT #${idxAcc+1} (pro-fixed) =====`)
-  const est = new DualWindow(4, W1, W2, EMA_A)
-  const vol = new Vol(VOL_WIN)
+  let pnl = 0
+  let cooldownLeft = 0
+  const recentWins = []
 
-  let t=0, pnl=0, lossStreak=0, firewall=0, lastStatus=200
+  const printer = createPrettyPrinter(25) // luôn pretty có màu; dùng terminal hỗ trợ ANSI
 
-  while(true){
-    t++
+  for (let r=1; ; r++){ // chạy vô hạn; dừng nếu roundsLimit được set
+    if (Number.isFinite(roundsLimit) && r > roundsLimit) break
 
-    const { arm, evG, evArm } = chooseArm(est)
-    const color = INDEX_TO_COLOR[arm]
-    const pEst  = est.p2(arm)
-    const bet   = betSize(pEst, arm, firewall>0, vol)
+    // pick
+    let arm, evLCB=null, pLCB=null, pMean=null, reason=[]
+    if (Number.isFinite(baseIndex)) { arm = baseIndex; reason.push('FORCE_IDX') }
+    else if (r <= WARMUP_ROUNDS)     { arm = (r-1) % 4; reason.push('WARMUP') }
+    else {
+      const pick = ts.chooseArmLCB(epsAtRound(r), MULTIPLIERS)
+      arm = pick.arm; evLCB = pick.ev; pLCB = pick.lcb; pMean = pick.mean
+    }
+    const color = INDEX_TO_COLOR[arm] || `IDX_${arm}`
+    if (pMean == null) pMean = ts.postMean()[arm]
+    if (pLCB == null) pLCB = DirichletTS.pLCB(ts.getAlpha(), arm, 2.33).lcb
+    const multEst  = MULTIPLIERS[arm]
+    const edgeMean = pMean * multEst - 1
+    if (evLCB == null) evLCB = pLCB * multEst - 1 // safety gate
 
-    // --- Call API ---
-    let res; try{ res = await spin({ cookie, idx:arm, bet, dispatcher }) }
-    catch(e){ console.log(`[${idxAcc+1}] neterr: ${e?.message||e}`); await sleep(nextDelay('net')); continue }
-    lastStatus = res.status
+    const kelly = clamp(kellyFraction(pMean, multEst) * RISK_AVERSION, 0, KELLY_CAP)
 
-    // --- Parse & PAYOUT CORRECTLY ---
-    const out = extractOutcome(res.parsed)
-    const landed = (typeof out.landedIndex==='number') ? out.landedIndex : null
-    const landedName = out.color || (landed!=null? INDEX_TO_COLOR[landed] : 'unknown')
+    // ---- SIZING ----
+    let betFactor = EV_GATE_FACTOR
+    let betUsed
+    const rollWins = recentWins.reduce((s,v)=>s+v,0)
+    const rollRate = recentWins.length ? rollWins / recentWins.length : 1
+    const inCooldown = (cooldownLeft > 0) || (recentWins.length >= ROLL_N && rollRate < ROLL_MIN_WINRATE)
+    if (inCooldown) cooldownLeft = Math.max(cooldownLeft, COOLDOWN_ROUNDS)
+    if (inCooldown) reason.push('COOLDOWN')
 
-    // ❗ CHỈ THẮNG khi isWin===true (nếu server cung cấp) hoặc landed===arm
-    const win = (typeof out.isWin==='boolean') ? out.isWin : (landed===arm)
-    const payout = win
-      ? (typeof out.winAmount==='number' ? out.winAmount : Math.round(bet*MULT[arm]))
-      : 0
+    if (r <= WARMUP_ROUNDS || evLCB <= 0) {
+      reason.push('EV<=0')
+      betUsed = ABS_SCOUT
+      betFactor = betUsed / baseBet
+    } else {
+      const tier =
+        evLCB > 0.15 ? 1.00 :
+        evLCB > 0.05 ? 0.60 :
+                       0.35
+      const rawFactor = 1 + 0.4*edgeMean + kelly
+      betFactor = clamp(rawFactor * tier, BET_MIN_FACTOR, BET_MAX_FACTOR)
+      if (inCooldown) betFactor = Math.min(betFactor, COOLDOWN_BET_FACTOR)
+      betUsed = Math.max(1, Math.floor(baseBet * betFactor))
+      if (typeof ABS_MAX === 'number') betUsed = Math.min(betUsed, ABS_MAX)
+      betUsed = Math.max(betUsed, Math.min(ABS_SCOUT, baseBet))
+    }
 
-    const net = payout - bet
+    // spin
+    const { ok, status, text } = await spinOnce({ cookie, betAmount: betUsed, armIndex: arm, dispatcher })
+
+    // outcome: chỉ lấy landedIndex/màu
+    const outcome = extractOutcomeStrict(text)
+    const landedIndex = outcome.landedIndex
+    const landedName  = outcome.color || (Number.isInteger(landedIndex) ? (INDEX_TO_COLOR[landedIndex] ?? landedIndex) : 'unknown')
+
+    // STRICT: win IFF arm == landedIndex
+    const winnerMatch = Number.isInteger(landedIndex) && landedIndex === arm
+    const payoutUsed  = winnerMatch ? Number((betUsed * multEst).toFixed(2)) : 0
+    const net         = payoutUsed - betUsed
     pnl += net
 
-    if (landed!=null) est.push(landed)
-    vol.push((payout-bet)/Math.max(1,bet))
+    // update model
+    if (Number.isInteger(landedIndex)) ts.updateFromLanded(landedIndex)
+    ts.decay(DECAY)
 
-    // firewall
-    if(net<0) lossStreak++; else lossStreak=0
-    if(lossStreak>=MAX_LOSS_STREAK && firewall===0) firewall=FIREWALL_SPINS
-    else if(firewall>0) firewall--
+    // rolling window
+    recentWins.push(winnerMatch ? 1 : 0)
+    if (recentWins.length > ROLL_N) recentWins.shift()
+    if (cooldownLeft > 0) cooldownLeft--
 
-    // Log
-    if(t%LOG_EVERY===0){
-      const pA = est.p2(arm), evA = pA*MULT[arm]-1
-      const tags = `${firewall>0?' | FW:'+firewall:''}${win?' | WIN':''}`
-      console.log(`[${idxAcc+1}] t=${t} bet=${bet} on ${color} → landed=${landedName} | net=${net>=0?'+':''}${net} | PnL=${pnl>=0?'+':''}${pnl} | EV(G)~${(evG*100).toFixed(2)}% EV(${color})~${(evA*100).toFixed(2)}%${tags}`)
+    // row
+    const rowObj = {
+      acc: idxAcc+1, round: r,
+      betBase: baseBet, betUsed, betFactor,
+      index: arm, color,
+      pMean, pLCB, multEst, evLCB, edgeMean,
+      landedName, payoutUsed, net, pnl, status, tags: reason
     }
 
-    if(TAKE_PROFIT!=null && pnl>=TAKE_PROFIT){ console.log('🎯 Take-profit'); break }
-    if(STOP_LOSS!=null   && pnl<=STOP_LOSS){   console.log('🛑 Stop-loss'); break }
+    if ((r % logEvery) === 0) {
+      if (uiMode === 'pretty') printer.push(rowObj)
+      else { // clean/plain nếu muốn, vẫn in pretty làm mặc định
+        printer.push(rowObj)
+      }
+    }
 
-    await sleep(nextDelay(lastStatus))
+    // CSV
+    appendLog({
+      round: r,
+      acc: idxAcc+1,
+      betBase: baseBet,
+      betUsed,
+      betFactor,
+      index: arm,
+      color,
+      ok, status,
+      landedIndex,
+      payoutUsed,
+      pMean, pLCB,
+      multEst,
+      evLCB,
+      edgeMean,
+      kelly: clamp(kellyFraction(pMean, multEst) * RISK_AVERSION, 0, KELLY_CAP),
+      net,
+      pnl,
+      reason: reason.join('|'),
+      alpha: ts.getAlpha(),
+      raw: outcome.raw
+    })
+
+    await waitMs(randInt(MIN_DELAY, MAX_DELAY))
+    if (Number.isFinite(roundsLimit) && r >= roundsLimit) break
   }
 }
 
-// ================== Driver ==================
-async function main(){
-  const accs = loadAccounts()
-  if(!accs.length){ console.error('❌ data.txt empty or missing.'); process.exit(1) }
-  const proxies = loadProxies()
-  for(let i=0;i<accs.length;i++){
-    const dispatcher = pickProxy(proxies, i)
-    await runAccount({ idxAcc:i, cookie: accs[i].cookie, dispatcher })
+// ==================== CLI / Main ====================
+async function promptBetIfNeeded() {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout })
+  const ask = q => new Promise(res => rl.question(q, v => res(v)))
+  let v = await ask(`Nhập số AP để bet (mặc định 1000): `)
+  rl.close()
+  v = v.trim()
+  const n = Number(v || '1000')
+  return (!Number.isFinite(n) || n <= 0) ? 1000 : n
+}
+function parseCli() {
+  const get = (k, d = null) => {
+    const arg = process.argv.find(a => a.startsWith(`--${k}=`))
+    return arg ? arg.split('=')[1] : d
   }
+  const roundsCli = Number(get('rounds', NaN)) // NaN -> infinite
+  const logEvery = Number(get('log-every', 1)) || 1
+  const uiMode  = (get('ui','pretty') || 'pretty').toLowerCase() // pretty|clean (pretty mặc định)
+  return { roundsCli, logEvery, uiMode }
+}
+function parseProxiesSafe() { try { return parseProxies('proxy.txt') } catch { return [] } }
+
+async function main() {
+  ensureLogHeader()
+  const accounts = parseAccounts('data.txt')
+  if (!accounts.length) { console.error('❌ Không tìm thấy tài khoản trong data.txt'); process.exit(1) }
+  const proxies = parseProxiesSafe()
+  const { roundsCli, logEvery, uiMode } = parseCli()
+
+  const allHaveBet = accounts.every(a => Number.isFinite(a.bet) && a.bet > 0)
+  const promptBet = allHaveBet ? null : await promptBetIfNeeded()
+
+  for (let k=0; k<accounts.length; k++){
+    const a = accounts[k]
+    if (!a.cookie){ console.log(`[ACC #${k+1}] thiếu cookie, bỏ qua.`); continue }
+    const baseBet   = Number.isFinite(a.bet) && a.bet > 0 ? a.bet : (promptBet ?? 1000)
+    const baseIndex = Number.isFinite(a.index) ? a.index : NaN
+    const dispatcher = pickProxyAgent(proxies, k) || undefined
+    await runForAccount({ idxAcc:k, cookie:a.cookie, baseBet, baseIndex, roundsLimit: roundsCli, dispatcher, logEvery, uiMode })
+  }
+  console.log('\n✔️ Hoàn tất.')
 }
 main().catch(e=>{ console.error(e); process.exit(1) })
